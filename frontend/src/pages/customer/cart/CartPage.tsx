@@ -16,115 +16,236 @@ import {
 } from "flowbite-react";
 import { HiTrash, HiMinus, HiPlus, HiShoppingCart } from "react-icons/hi";
 import {
-  getCurrentCart,
+  getOrCreateCart,
   updateCartItem,
   deleteCartItems,
+  getCurrentCart,
 } from "../../../services/cart/cartService";
+import {
+  deleteCartCombos,
+  clearCartCombos,
+  updateCartCombo,
+} from "../../../services/cart/comboCartService";
 import type { Cart, CartItem } from "../../../services/cart/cartService";
+import type { CartComboItem } from "../../../services/cart/comboCartService";
 import { useNotification } from "../../../components/Notification/NotificationContext";
-import ConfirmDialog from "../../../components/common/ConfirmDialogProps ";
+import ConfirmDialog from "../../../components/common/ConfirmDialogProps";
 import { checkoutCart } from "../../../services/order/checkoutService";
 import type { OrderDto } from "../../../services/types/OrderType";
 import { useNavigate } from "react-router-dom";
+import { useCart } from "../../../store/CartContext";
+import { connectWebSocket } from "../../../api/websocketClient";
+import { getMenuItemById } from "../../../services/product/fetchProduct";
+import { useTranslation } from "react-i18next";
+import { useRealtimeUpdate } from "../../../api/useRealtimeUpdate";
+import { useAuth } from "../../../store/AuthContext";
 
 const CartPage: React.FC = () => {
-  /** State quản lý giỏ hàng */
+  const { t } = useTranslation();
+  const { user } = useAuth();
   const [cart, setCart] = useState<Cart | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
-  const [error, setError] = useState<string | null>(null);
+  const [error] = useState<string | null>(null);
   const [cartUpdated, setCartUpdated] = useState<number>(0);
-
-  /** State xác nhận xóa */
+  const [showAllItems, setShowAllItems] = useState(false);
+  const ITEMS_TO_SHOW = 5;
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [confirmAction, setConfirmAction] = useState<() => void>(() => {});
   const [confirmMessage, setConfirmMessage] = useState<string>("");
-
-  /** State lưu các item đã chọn */
   const [selectedItems, setSelectedItems] = useState<number[]>([]);
-
+  const [selectedCombos, setSelectedCombos] = useState<number[]>([]);
+  const { fetchCart } = useCart();
   const { notify } = useNotification();
   const navigate = useNavigate();
 
-  /** Fetch giỏ hàng mỗi khi cartUpdated thay đổi */
   useEffect(() => {
-    const fetchCart = async () => {
+    const fetchCartData = async () => {
       try {
-        const data = await getCurrentCart();
+        const data = await getOrCreateCart();
         setCart(data);
-      } catch (err) {
-        setError("Không thể tải giỏ hàng. Vui lòng thử lại.");
       } finally {
         setLoading(false);
       }
     };
-    fetchCart();
-  }, [cartUpdated]);
+    fetchCartData();
+  }, [cartUpdated, t]);
 
-  /**
-   * Cập nhật số lượng món
-   */
+  useEffect(() => {
+    if (!cart?.items?.length) return;
+
+    const clients = cart.items.map((item) =>
+      connectWebSocket<{ menuItemId: number }>(
+        `/topic/menu/${item.menuItemId}`,
+        async (message) => {
+          console.log(t("cart.realtimeUpdate"), message.menuItemId);
+          try {
+            const updated = await getMenuItemById(message.menuItemId);
+            setCart((prev) => {
+              if (!prev) return prev;
+              const updatedItems = prev.items?.map((it) =>
+                it.menuItemId === message.menuItemId
+                  ? {
+                      ...it,
+                      status: updated?.status ?? it.status,
+                      price: updated?.price ?? it.price,
+                      availableQuantity:
+                        updated?.availableQuantity ?? it.availableQuantity,
+                    }
+                  : it
+              );
+              return { ...prev, items: updatedItems };
+            });
+          } catch (err) {
+            console.error(t("cart.realtimeError"), err);
+          }
+        }
+      )
+    );
+
+    return () => {
+      clients.forEach((client) => client.deactivate());
+    };
+  }, [cart?.items, t]);
+
+  useRealtimeUpdate(
+    `/topic/menu/update`,
+    getMenuItemById,
+    (updatedProduct) => {
+      if (!updatedProduct) return;
+
+      // Cập nhật lại giỏ hàng: thay đổi thông tin của món tương ứng
+      setCart((prev) => {
+        if (!prev) return prev;
+        const updatedItems = prev.items?.map((item) =>
+          item.menuItemId === updatedProduct.id
+            ? {
+                ...item,
+                status: updatedProduct.status ?? item.status,
+                price: updatedProduct.price ?? item.price,
+                availableQuantity:
+                  updatedProduct.availableQuantity ?? item.availableQuantity,
+              }
+            : item
+        );
+        return { ...prev, items: updatedItems };
+      });
+
+      // Thông báo realtime
+      notify(
+        "info",
+        t("mealPage.notification.itemUpdated", { name: updatedProduct.name })
+      );
+    },
+    (msg: { menuItemId: number }) => msg.menuItemId
+  );
+
+  useRealtimeUpdate(
+    `/topic/cart/${user?.publicId}`,
+    async () => await getCurrentCart(),
+    (updatedCart) => {
+      console.log("🛒 Cart updated realtime:", updatedCart);
+      setCart(updatedCart);
+      notify("info", t("cart.realtimeCartUpdated"));
+    },
+    () => user?.publicId
+  );
+
   const handleUpdateQuantity = async (
     itemId: number,
     newQuantity: number,
-    availableQuantity?: number
+    availableQuantity?: number,
+    isCombo?: boolean
   ) => {
     if (newQuantity < 1) {
-      notify("error", "Số lượng phải lớn hơn 0.");
+      notify("error", t("cart.quantityMin"));
       return;
     }
     if (availableQuantity !== undefined && newQuantity > availableQuantity) {
-      notify("error", `Số lượng tối đa cho món này là ${availableQuantity}.`);
+      notify("error", t("cart.quantityMax", { qty: availableQuantity }));
       return;
     }
+
+    console.log(isCombo);
+
     try {
-      await updateCartItem(itemId, newQuantity);
+      if (isCombo) {
+        await updateCartCombo(itemId, newQuantity);
+      } else {
+        await updateCartItem(itemId, newQuantity);
+      }
+
       setCartUpdated((prev) => prev + 1);
-      notify("success", "Cập nhật số lượng thành công!");
+      notify("success", t("cart.updateSuccess"));
+      await fetchCart();
     } catch (err) {
-      notify("error", "Cập nhật số lượng thất bại. Vui lòng thử lại.");
+      notify("error", t("cart.updateFail"));
     }
   };
 
-  /**
-   * Xóa một hoặc nhiều món
-   */
   const handleRemoveItem = async (itemIds: number[]) => {
     try {
       await deleteCartItems({ itemIds });
       setCartUpdated((prev) => prev + 1);
       setSelectedItems([]);
-      notify("success", "Đã xóa khỏi giỏ hàng");
+      notify("success", t("cart.removeSuccess"));
+      await fetchCart();
     } catch (err) {
-      notify("error", "Xóa món thất bại. Vui lòng thử lại.");
+      notify("error", t("cart.removeFail"));
     }
   };
 
-  /** Xóa toàn bộ giỏ hàng */
   const handleClearCart = async () => {
     if (!cart) return;
     try {
       await deleteCartItems({ cartId: cart.id });
       setCartUpdated((prev) => prev + 1);
       setSelectedItems([]);
-      notify("success", "Đã xóa toàn bộ giỏ hàng");
+      notify("success", t("cart.clearSuccess"));
+      await fetchCart();
     } catch (err) {
-      notify("error", "Xóa toàn bộ thất bại. Vui lòng thử lại.");
+      notify("error", t("cart.clearFail"));
     }
   };
 
-  /** Thanh toán giỏ hàng */
+  const handleRemoveCombo = async (comboIds: number[]) => {
+    try {
+      await deleteCartCombos({ comboIds });
+      setCartUpdated((prev) => prev + 1);
+      setSelectedCombos([]);
+      notify("success", t("cart.removeComboSuccess"));
+      await fetchCart();
+    } catch (err) {
+      notify("error", t("cart.removeComboFail"));
+    }
+  };
+
+  const handleClearCombos = async () => {
+    if (!cart) return;
+    try {
+      await clearCartCombos(cart.id);
+      setCartUpdated((prev) => prev + 1);
+      setSelectedCombos([]);
+      notify("success", t("cart.clearComboSuccess"));
+      await fetchCart();
+    } catch (err) {
+      notify("error", t("cart.clearComboFail"));
+    }
+  };
+
   const handleCheckout = useCallback(async () => {
     if (!cart) return;
     try {
       const order: OrderDto = await checkoutCart(cart);
-      notify("success", `Đặt hàng thành công! Mã đơn: ${order.publicId}`);
-      navigate(`/order`);
+      notify(
+        "success",
+        t("cart.checkoutSuccess", { publicId: order.publicId })
+      );
+      navigate(`/orders/${order.publicId}/payment`);
     } catch (err) {
-      notify("error", "Đặt hàng thất bại. Vui lòng thử lại.");
+      notify("error", t("cart.checkoutFail"));
     }
-  }, [cart, navigate, notify]);
+  }, [cart, navigate, notify, t]);
 
-  /** Chọn / bỏ chọn item */
   const toggleSelectItem = useCallback((itemId: number) => {
     setSelectedItems((prev) =>
       prev.includes(itemId)
@@ -133,32 +254,47 @@ const CartPage: React.FC = () => {
     );
   }, []);
 
-  /** Tính tổng tiền giỏ hàng */
-  const calculateTotal = (items?: CartItem[]): string => {
-    if (!items) return "0.00";
-    const total = items.reduce(
-      (sum, item) =>
-        item.status === "AVAILABLE"
-          ? sum + item.quantity * (item.price || 0)
-          : sum,
-      0
+  const toggleSelectCombo = useCallback((comboId: number) => {
+    setSelectedCombos((prev) =>
+      prev.includes(comboId)
+        ? prev.filter((id) => id !== comboId)
+        : [...prev, comboId]
     );
-    return total.toLocaleString("vi-VN", {
-      style: "currency",
-      currency: "VND",
-    });
-  };
+  }, []);
 
-  /** Tính tổng số món */
-  const calculateTotalItems = (items?: CartItem[]): number => {
-    if (!items) return 0;
-    return items.reduce(
+  // const calculateTotal = (items?: CartItem[]): string => {
+  //   if (!items) return "0.00";
+  //   const total = items.reduce(
+  //     (sum, item) =>
+  //       item.status === "AVAILABLE"
+  //         ? sum + item.quantity * (item.price || 0)
+  //         : sum,
+  //     0
+  //   );
+  //   return total.toLocaleString("vi-VN", {
+  //     style: "currency",
+  //     currency: "VND",
+  //   });
+  // };
+
+  const calculateTotalItems = (
+    items?: CartItem[],
+    combos?: CartComboItem[]
+  ): number => {
+    const itemCount = (items ?? []).reduce(
       (sum, item) => (item.status === "AVAILABLE" ? sum + item.quantity : sum),
       0
     );
+
+    const comboCount = (combos ?? []).reduce(
+      (sum, combo) =>
+        combo.status === "AVAILABLE" ? sum + combo.quantity : sum,
+      0
+    );
+
+    return itemCount + comboCount;
   };
 
-  /** Kiểm tra giỏ hàng hợp lệ trước khi thanh toán */
   const isCartValid = (items?: CartItem[]): boolean => {
     if (!items) return false;
     return items.every(
@@ -168,14 +304,22 @@ const CartPage: React.FC = () => {
     );
   };
 
-  /** Mở dialog xác nhận xóa */
-  const openConfirm = (message: string, action: () => void) => {
+  const availableItems =
+    cart?.items?.filter((item) => item.status === "AVAILABLE") || [];
+
+  const visibleItems = cart?.items
+    ? showAllItems
+      ? cart.items
+      : cart.items.slice(0, ITEMS_TO_SHOW)
+    : [];
+  const hasMoreItems = cart?.items && cart.items.length > ITEMS_TO_SHOW;
+
+  const openConfirmDialog = (message: string, action: () => void) => {
     setConfirmMessage(message);
     setConfirmAction(() => action);
     setConfirmOpen(true);
   };
 
-  /** Loading */
   if (loading)
     return (
       <div className="flex justify-center items-center h-screen bg-gray-50">
@@ -183,7 +327,6 @@ const CartPage: React.FC = () => {
       </div>
     );
 
-  /** Error */
   if (error)
     return (
       <div className="text-center text-red-500 p-4">
@@ -191,210 +334,402 @@ const CartPage: React.FC = () => {
       </div>
     );
 
-  /** Render giao diện giỏ hàng */
   return (
     <section className="min-h-screen bg-gradient-to-br from-amber-50 to-orange-100 py-12 px-4 sm:px-6 md:px-8">
       <div className="container mx-auto max-w-8xl py-12 px-4 md:px-6">
         <h1 className="text-4xl font-bold mb-8 text-center text-amber-800">
-          Giỏ hàng của bạn
+          {t("cart.title")}
         </h1>
 
-        {cart && cart.items && cart.items.length > 0 ? (
+        {cart?.status === "OPEN" &&
+        ((cart?.items?.length ?? 0) > 0 || (cart?.combos?.length ?? 0) > 0) ? (
           <Card className="shadow-lg border-none !bg-white/90 backdrop-blur-sm">
-            {/* Bảng danh sách món */}
-            <Table hoverable striped className="rounded-lg">
-              <TableHead>
-                <TableHeadCell className="text-center !bg-amber-100 !text-gray-700">
-                  <Checkbox disabled />
-                </TableHeadCell>
-                <TableHeadCell className="text-center !bg-amber-100 !text-gray-700">
-                  Hình ảnh
-                </TableHeadCell>
-                <TableHeadCell className="text-center !bg-amber-100 !text-gray-700">
-                  Tên món
-                </TableHeadCell>
-                <TableHeadCell className="text-center !bg-amber-100 !text-gray-700">
-                  Số lượng
-                </TableHeadCell>
-                <TableHeadCell className="text-center !bg-amber-100 !text-gray-700">
-                  Giá
-                </TableHeadCell>
-                <TableHeadCell className="text-center !bg-amber-100 !text-gray-700">
-                  Hành động
-                </TableHeadCell>
-              </TableHead>
+            {cart.items && cart.items.length > 0 && (
+              <div className="mt-8">
+                <h2 className="text-2xl font-semibold text-amber-700 mb-4">
+                  {t("cart.menuItems")}
+                </h2>
+                <Table hoverable striped className="rounded-lg">
+                  <TableHead>
+                    <TableHeadCell className="text-center !bg-amber-100 !text-gray-700">
+                      <Checkbox className="mx-auto !bg-white" disabled />
+                    </TableHeadCell>
+                    <TableHeadCell className="text-center !bg-amber-100 !text-gray-700">
+                      {t("cart.image")}
+                    </TableHeadCell>
+                    <TableHeadCell className="text-center !bg-amber-100 !text-gray-700">
+                      {t("cart.itemName")}
+                    </TableHeadCell>
+                    <TableHeadCell className="text-center !bg-amber-100 !text-gray-700">
+                      {t("cart.quantity")}
+                    </TableHeadCell>
+                    <TableHeadCell className="text-center !bg-amber-100 !text-gray-700">
+                      {t("cart.price")}
+                    </TableHeadCell>
+                    <TableHeadCell className="text-center !bg-amber-100 !text-gray-700">
+                      {t("cart.actions")}
+                    </TableHeadCell>
+                  </TableHead>
 
-              <TableBody className="divide-y">
-                {cart.items.map((item) => (
-                  <TableRow
-                    key={item.id}
-                    className={`!bg-white hover:!bg-amber-50 transition-colors duration-200 ${
-                      item.status === "OUT_OF_STOCK" ? "opacity-50" : ""
-                    }`}>
-                    <TableCell className="text-center">
-                      <Checkbox
-                        checked={selectedItems.includes(item.id)}
-                        onChange={() => toggleSelectItem(item.id)}
-                        className="mx-auto !bg-white"
-                      />
-                    </TableCell>
+                  <TableBody className="divide-y">
+                    {visibleItems.map((item) => (
+                      <TableRow
+                        key={item.id}
+                        className={`!bg-white hover:!bg-amber-50 transition-colors duration-200 ${
+                          item.status === "OUT_OF_STOCK" ? "opacity-50" : ""
+                        }`}>
+                        <TableCell className="text-center">
+                          <Checkbox
+                            checked={selectedItems.includes(item.id)}
+                            onChange={() => toggleSelectItem(item.id)}
+                            className="mx-auto !bg-white"
+                          />
+                        </TableCell>
 
-                    <TableCell className="text-center py-4">
-                      <img
-                        src={item.avatarUrl}
-                        alt={item.menuItemName}
-                        className="w-20 h-20 object-cover rounded-lg shadow-sm mx-auto"
-                      />
-                    </TableCell>
+                        <TableCell className="text-center py-4">
+                          <img
+                            src={item.avatarUrl}
+                            alt={item.menuItemName}
+                            className="w-20 h-20 object-cover rounded-lg shadow-sm mx-auto"
+                          />
+                        </TableCell>
 
-                    <TableCell className="font-medium text-center !text-gray-800">
-                      <Tooltip
-                        content={item.description || "Không có mô tả"}
-                        placement="top">
-                        <span>
-                          {item.menuItemName} (
-                          {item.categoryName || "Không xác định"})
-                        </span>
-                      </Tooltip>
-                      {item.status === "OUT_OF_STOCK" && (
-                        <Badge color="failure" className="mt-2">
-                          Hết hàng
-                        </Badge>
-                      )}
-                    </TableCell>
+                        <TableCell className="font-medium text-center !text-gray-800">
+                          <Tooltip
+                            content={
+                              item.description || t("cart.noDescription")
+                            }
+                            placement="top">
+                            <span>
+                              {item.menuItemName} (
+                              {item.categoryName || t("cart.noCategory")})
+                            </span>
+                          </Tooltip>
+                          {item.status === "OUT_OF_STOCK" && (
+                            <Badge color="failure" className="mt-2">
+                              {t("cart.outOfStock")}
+                            </Badge>
+                          )}
+                        </TableCell>
 
-                    <TableCell className="flex justify-center items-center translate-y-1/4 gap-2">
-                      <div className="flex items-center justify-center gap-1 bg-gray-100 rounded-full overflow-hidden w-max">
-                        {/* Nút giảm */}
-                        <button
-                          onClick={() =>
-                            handleUpdateQuantity(
-                              item.id,
-                              item.quantity - 1,
-                              item.availableQuantity
-                            )
-                          }
-                          disabled={
-                            item.quantity <= 1 || item.status === "OUT_OF_STOCK"
-                          }
-                          className="flex items-center justify-center w-8 h-8 bg-gray-300 hover:bg-gray-400 transition-colors duration-150 disabled:opacity-50">
-                          <HiMinus className="h-4 w-4 text-stone-800" />
-                        </button>
+                        <TableCell className="flex justify-center items-center translate-y-1/4 gap-2">
+                          <div className="flex items-center justify-center gap-1 bg-gray-100 rounded-full overflow-hidden w-max">
+                            <button
+                              onClick={() =>
+                                handleUpdateQuantity(
+                                  item.id,
+                                  item.quantity - 1,
+                                  item.availableQuantity,
+                                  false
+                                )
+                              }
+                              disabled={
+                                item.quantity <= 1 ||
+                                item.status === "OUT_OF_STOCK"
+                              }
+                              className="flex items-center justify-center w-8 h-8 bg-gray-300 hover:bg-gray-400 transition-colors duration-150 disabled:opacity-50">
+                              <HiMinus className="h-4 w-4 text-stone-800" />
+                            </button>
 
-                        <span className="w-10 text-center font-medium text-gray-700">
-                          {item.quantity}
-                        </span>
+                            <span className="w-10 text-center font-medium text-gray-700">
+                              {item.quantity}
+                            </span>
 
-                        {/* Nút tăng */}
-                        <button
-                          onClick={() =>
-                            handleUpdateQuantity(
-                              item.id,
-                              item.quantity + 1,
-                              item.availableQuantity
-                            )
-                          }
-                          disabled={item.status === "OUT_OF_STOCK"}
-                          className="flex items-center justify-center w-8 h-8 bg-gray-300 hover:bg-gray-400 transition-colors duration-150 disabled:opacity-50">
-                          <HiPlus className="h-4 w-4 text-stone-800" />
-                        </button>
-                      </div>
+                            <button
+                              onClick={() =>
+                                handleUpdateQuantity(
+                                  item.id,
+                                  item.quantity + 1,
+                                  item.availableQuantity,
+                                  false
+                                )
+                              }
+                              disabled={item.status === "OUT_OF_STOCK"}
+                              className="flex items-center justify-center w-8 h-8 bg-gray-300 hover:bg-gray-400 transition-colors duration-150 disabled:opacity-50">
+                              <HiPlus className="h-4 w-4 text-stone-800" />
+                            </button>
+                          </div>
+                        </TableCell>
 
-                      {/* Thông báo còn ít hàng */}
-                      {item.availableQuantity &&
-                        item.quantity > item.availableQuantity && (
-                          <p className="text-red-500 text-sm mt-2">
-                            Chỉ còn {item.availableQuantity} món
+                        <TableCell className="text-center !text-gray-800">
+                          {(item.quantity * (item.price || 0)).toLocaleString(
+                            "vi-VN",
+                            {
+                              style: "currency",
+                              currency: "VND",
+                            }
+                          )}
+                        </TableCell>
+
+                        <TableCell className="flex justify-center translate-y-1/4">
+                          <Button
+                            color="failure"
+                            size="sm"
+                            className="!text-white !bg-red-500 hover:!bg-red-600"
+                            onClick={() =>
+                              openConfirmDialog(
+                                t("cart.confirmRemoveItem", {
+                                  name: item.menuItemName,
+                                }),
+                                () => handleRemoveItem([item.id])
+                              )
+                            }>
+                            <HiTrash className="h-5 w-5" />
+                          </Button>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+
+                {hasMoreItems && (
+                  <div className="mt-2 text-center">
+                    <Button
+                      size="sm"
+                      color="gray"
+                      onClick={() => setShowAllItems(!showAllItems)}>
+                      {showAllItems
+                        ? t("cart.collapseList")
+                        : t("cart.viewMore", {
+                            count: availableItems.length - ITEMS_TO_SHOW,
+                          })}
+                    </Button>
+                  </div>
+                )}
+              </div>
+            )}
+            {cart.combos && cart.combos.length > 0 && (
+              <div className="mt-8">
+                <h2 className="text-2xl font-semibold text-amber-700 mb-4">
+                  {t("cart.combos")}
+                </h2>
+
+                <Table hoverable striped className="rounded-lg">
+                  <TableHead>
+                    <TableHeadCell className="text-center !bg-amber-100 !text-gray-700">
+                      <Checkbox className="mx-auto !bg-white" disabled />
+                    </TableHeadCell>
+                    <TableHeadCell className="text-center !bg-amber-100 !text-gray-700">
+                      {t("cart.image")}
+                    </TableHeadCell>
+                    <TableHeadCell className="text-center !bg-amber-100 !text-gray-700">
+                      {t("cart.comboName")}
+                    </TableHeadCell>
+                    <TableHeadCell className="text-center !bg-amber-100 !text-gray-700">
+                      {t("cart.quantity")}
+                    </TableHeadCell>
+                    <TableHeadCell className="text-center !bg-amber-100 !text-gray-700">
+                      {t("cart.price")}
+                    </TableHeadCell>
+                    <TableHeadCell className="text-center !bg-amber-100 !text-gray-700">
+                      {t("cart.actions")}
+                    </TableHeadCell>
+                  </TableHead>
+
+                  <TableBody>
+                    {cart.combos.map((combo) => (
+                      <TableRow
+                        key={combo.id}
+                        className={`!bg-white hover:!bg-amber-50 transition-colors duration-200 ${
+                          combo.status === "OUT_OF_STOCK" ? "opacity-50" : ""
+                        }`}>
+                        {/* Checkbox chọn combo */}
+                        <TableCell className="text-center">
+                          <Checkbox
+                            checked={selectedCombos.includes(combo.id)}
+                            onChange={() => toggleSelectCombo(combo.id)}
+                            className="mx-auto !bg-white"
+                          />
+                        </TableCell>
+
+                        {/* Ảnh combo */}
+                        <TableCell className="text-center py-4">
+                          <img
+                            src={combo.avatarUrl || "/default-combo.jpg"}
+                            alt={combo.comboName}
+                            className="w-20 h-20 object-cover rounded-lg shadow-sm mx-auto"
+                          />
+                        </TableCell>
+
+                        {/* Thông tin combo */}
+                        <TableCell className="font-medium text-center !text-gray-800">
+                          {combo.comboName}{" "}
+                          <Badge color="info" className="ml-2">
+                            {combo.categoryName}
+                          </Badge>
+                          {combo.status === "OUT_OF_STOCK" && (
+                            <Badge color="failure" className="ml-2">
+                              {t("cart.outOfStock")}
+                            </Badge>
+                          )}
+                          <p className="text-sm text-gray-500">
+                            {combo.description}
                           </p>
-                        )}
-                    </TableCell>
+                          <ul className="text-left mt-2 text-sm text-gray-600">
+                            {combo.items.map((ci) => (
+                              <li key={ci.id}>
+                                • {ci.name} × {ci.quantity} —{" "}
+                                {ci.price.toLocaleString("vi-VN", {
+                                  style: "currency",
+                                  currency: "VND",
+                                })}
+                              </li>
+                            ))}
+                          </ul>
+                        </TableCell>
 
-                    <TableCell className="text-center !text-gray-800">
-                      {(item.quantity * (item.price || 0)).toLocaleString(
-                        "vi-VN",
-                        {
-                          style: "currency",
-                          currency: "VND",
-                        }
-                      )}
-                    </TableCell>
+                        {/* Nút tăng giảm số lượng combo */}
+                        <TableCell className="flex justify-center items-center translate-y-1/4 gap-2">
+                          <div className="flex items-center justify-center gap-1 bg-gray-100 rounded-full overflow-hidden w-max">
+                            <button
+                              onClick={() =>
+                                handleUpdateQuantity(
+                                  combo.id,
+                                  combo.quantity - 1,
+                                  undefined,
+                                  true
+                                )
+                              }
+                              disabled={
+                                combo.quantity <= 1 ||
+                                combo.status === "OUT_OF_STOCK"
+                              }
+                              className="flex items-center justify-center w-8 h-8 bg-gray-300 hover:bg-gray-400 transition-colors duration-150 disabled:opacity-50">
+                              <HiMinus className="h-4 w-4 text-stone-800" />
+                            </button>
 
-                    <TableCell className="flex justify-center translate-y-1/4">
-                      <Button
-                        color="failure"
-                        size="sm"
-                        className="!text-white !bg-red-500 hover:!bg-red-600"
-                        onClick={() =>
-                          openConfirm(
-                            `Bạn có chắc muốn xóa "${item.menuItemName}" khỏi giỏ hàng?`,
-                            () => handleRemoveItem([item.id])
-                          )
-                        }
-                        disabled={item.status === "OUT_OF_STOCK"}>
-                        <HiTrash className="h-5 w-5" />
-                      </Button>
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
+                            <span className="w-10 text-center font-medium text-gray-700">
+                              {combo.quantity}
+                            </span>
 
-            {/* Nút xóa món */}
+                            <button
+                              onClick={() =>
+                                handleUpdateQuantity(
+                                  combo.id,
+                                  combo.quantity + 1,
+                                  undefined,
+                                  true
+                                )
+                              }
+                              disabled={combo.status === "OUT_OF_STOCK"}
+                              className="flex items-center justify-center w-8 h-8 bg-gray-300 hover:bg-gray-400 transition-colors duration-150 disabled:opacity-50">
+                              <HiPlus className="h-4 w-4 text-stone-800" />
+                            </button>
+                          </div>
+                        </TableCell>
+
+                        {/* Giá combo */}
+                        <TableCell className="text-center !text-gray-800">
+                          {(combo.price * combo.quantity).toLocaleString(
+                            "vi-VN",
+                            {
+                              style: "currency",
+                              currency: "VND",
+                            }
+                          )}
+                        </TableCell>
+
+                        {/* Nút xóa combo */}
+                        <TableCell className="flex justify-center translate-y-1/4">
+                          <Button
+                            color="failure"
+                            size="sm"
+                            className="!text-white !bg-red-500 hover:!bg-red-600"
+                            onClick={() =>
+                              openConfirmDialog(
+                                t("cart.confirmRemoveCombo", {
+                                  name: combo.comboName,
+                                }),
+                                () => handleRemoveCombo([combo.id])
+                              )
+                            }>
+                            <HiTrash className="h-5 w-5" />
+                          </Button>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+            )}
+
             <div className="mt-4 flex justify-between">
               <div className="flex gap-2">
                 <Button
                   color="red"
                   size="sm"
-                  onClick={() =>
-                    openConfirm(
-                      `Bạn có chắc muốn xóa ${selectedItems.length} món đã chọn?`,
-                      () => handleRemoveItem(selectedItems)
+                  onClick={() => {
+                    if (
+                      selectedItems.length === 0 &&
+                      selectedCombos.length === 0
                     )
-                  }
-                  disabled={selectedItems.length === 0}>
-                  Xóa đã chọn
+                      return;
+                    openConfirmDialog(
+                      t("cart.confirmRemoveSelected", {
+                        count: selectedItems.length + selectedCombos.length,
+                      }),
+                      async () => {
+                        if (selectedItems.length > 0)
+                          await handleRemoveItem(selectedItems);
+                        if (selectedCombos.length > 0)
+                          await handleRemoveCombo(selectedCombos);
+                      }
+                    );
+                  }}
+                  disabled={
+                    selectedItems.length === 0 && selectedCombos.length === 0
+                  }>
+                  {t("cart.removeSelected")}
                 </Button>
 
                 <Button
                   color="red"
                   size="sm"
                   onClick={() =>
-                    openConfirm(
-                      "Bạn có chắc muốn xóa toàn bộ giỏ hàng?",
-                      handleClearCart
-                    )
+                    openConfirmDialog(t("cart.confirmClear"), async () => {
+                      const tasks = [];
+                      if (cart.items && cart.items.length > 0)
+                        tasks.push(handleClearCart());
+                      if (cart.combos && cart.combos.length > 0)
+                        tasks.push(handleClearCombos());
+                      if (tasks.length > 0) await Promise.all(tasks);
+                    })
                   }
-                  disabled={!cart.items || cart.items.length === 0}>
-                  Xóa tất cả
+                  disabled={
+                    (!cart.items || cart.items.length === 0) &&
+                    (!cart.combos || cart.combos.length === 0)
+                  }>
+                  {t("cart.clearAll")}
                 </Button>
               </div>
             </div>
 
-            {/* Tổng số lượng và tổng tiền */}
             <div className="mt-6 flex justify-between items-center">
               <div className="text-gray-600">
                 <p className="text-lg">
-                  Tổng số món:{" "}
+                  {t("cart.totalItems")}:{" "}
                   <span className="font-semibold">
-                    {calculateTotalItems(cart.items)}
+                    {calculateTotalItems(cart.items, cart.combos)}
                   </span>
                 </p>
                 <p className="text-lg">
-                  Tổng cộng:{" "}
+                  {t("cart.totalPrice")}:{" "}
                   <span className="font-semibold text-amber-600">
-                    {calculateTotal(cart.items)}
+                    {cart.totalAmount?.toLocaleString("vi-VN", {
+                      style: "currency",
+                      currency: "VND",
+                    }) || "0 ₫"}
                   </span>
                 </p>
               </div>
 
-              {/* Nút quay lại menu và thanh toán */}
               <div className="flex gap-3">
                 <Button
                   color="gray"
                   size="lg"
                   className="!text-white bg-gray-500 hover:bg-gray-600 transition-colors duration-200"
                   href="/menu">
-                  Quay lại menu
+                  {t("cart.backToMenu")}
                 </Button>
 
                 <Button
@@ -403,35 +738,37 @@ const CartPage: React.FC = () => {
                   className="!text-white bg-gradient-to-r from-green-600 to-green-700 hover:from-green-700 hover:to-green-800 hover:scale-105 transition-transform duration-200"
                   disabled={!isCartValid(cart.items)}
                   onClick={handleCheckout}>
-                  Đặt hàng
+                  {t("cart.checkout")}
                 </Button>
               </div>
             </div>
           </Card>
-        ) : (
-          // Giỏ hàng trống
+        ) : cart ? (
           <Card className="shadow-lg border-none !bg-white/90 backdrop-blur-sm text-center py-12">
             <HiShoppingCart className="mx-auto h-16 w-16 !text-gray-400" />
-            <p className="text-xl text-gray-500 mt-4">
-              Giỏ hàng của bạn đang trống
-            </p>
+            <p className="text-xl text-gray-500 mt-4">{t("cart.empty")}</p>
             <Button
               color="primary"
-              className="mt-6 mx-auto !bg-amber-500 hover:!bg-amber-600"
+              className="mt-6 mx-auto text-white !bg-amber-500 hover:!bg-amber-600"
               href="/menu">
-              Xem thực đơn
+              {t("cart.viewMenu")}
             </Button>
           </Card>
+        ) : (
+          // ⏳ Đang load cart
+          <div className="text-center py-12 text-gray-500">
+            <Spinner size="lg" className="mx-auto mb-4" />
+            {t("cart.loading")}
+          </div>
         )}
       </div>
 
-      {/* Dialog xác nhận xóa */}
       <ConfirmDialog
         open={confirmOpen}
-        title="Xác nhận xóa"
+        title={t("cart.confirmTitle")}
         message={confirmMessage}
-        confirmText="Xóa"
-        cancelText="Hủy"
+        confirmText={t("cart.confirm")}
+        cancelText={t("cart.cancel")}
         onConfirm={() => {
           confirmAction();
           setConfirmOpen(false);

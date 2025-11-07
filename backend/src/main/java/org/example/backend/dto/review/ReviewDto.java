@@ -13,6 +13,8 @@ import java.time.LocalDateTime;
 public class ReviewDto {
 
     private Long id;
+    private Long menuItemId;
+    private String userId;
     private String userName;
     private String userAvatar;
     private Integer rating;
@@ -23,6 +25,8 @@ public class ReviewDto {
     public ReviewDto(Review entity) {
         if (entity != null) {
             this.id = entity.getId();
+            this.menuItemId = entity.getMenuItem().getId();
+            this.userId = entity.getUser().getPublicId();
             this.userName = entity.getUser().getName();
             this.userAvatar = entity.getUser().getAvatarUrl();
             this.rating = entity.getRating();

@@ -13,6 +13,7 @@ import {
 } from "flowbite-react";
 import type { Reservation } from "../../../services/reservation/reservationService";
 import type { TableEntity } from "../../../services/table/tableService";
+import { useTranslation } from "react-i18next";
 
 // Import Heroicons (Hi) và Font Awesome (Fa)
 import {
@@ -45,11 +46,12 @@ export default function BookedListModal({
   onCancel,
   translateStatus,
 }: BookedListModalProps) {
+  const { t } = useTranslation();
   return (
     <Modal show={show} onClose={onClose} popup size="5xl">
       <ModalHeader className="!bg-stone-700 !border-b-4 !border-yellow-600">
         <div className="text-2xl font-bold text-yellow-400">
-          Danh sách bàn đã đặt
+          {t("bookedList.title")}
         </div>
       </ModalHeader>
 
@@ -63,31 +65,29 @@ export default function BookedListModal({
         reservations.length === 0 ? (
           <div className="text-center py-10 bg-white rounded-lg shadow-sm border border-gray-200">
             <p className="text-gray-500 text-lg font-medium">
-              ☕ Chưa có bàn nào được đặt.
+              ☕ {t("bookedList.empty.title")}
             </p>
             <p className="text-sm text-gray-400 mt-1">
-              Hãy đặt bàn ngay để thưởng thức món ngon nhé!
+              {t("bookedList.empty.message")}
             </p>
           </div>
         ) : (
           /* 3. Hiển thị dưới dạng Bảng */
           <div className="overflow-x-auto rounded-lg shadow-lg border border-gray-200">
             <Table hoverable>
-              {/* PHẦN ĐẦU BẢNG: SỬ DỤNG !bg-stone-100 ĐỂ GHI ĐÈ MÀU MẶC ĐỊNH */}
               <TableHead>
-                <TableHeadCell className="p-4 !bg-stone-100"></TableHeadCell>{" "}
-                {/* Cột STT/Icon */}
+                <TableHeadCell className="p-4 !bg-stone-100"></TableHeadCell>
                 <TableHeadCell className="text-black !bg-stone-100">
-                  Bàn & Thời gian
+                  {t("bookedList.tableTime")}
                 </TableHeadCell>
                 <TableHeadCell className="text-black !bg-stone-100">
-                  Chi tiết
+                  {t("bookedList.details")}
                 </TableHeadCell>
                 <TableHeadCell className="text-black !bg-stone-100">
-                  Trạng thái
+                  {t("bookedList.statusHeader")}
                 </TableHeadCell>
                 <TableHeadCell className="text-center text-black !bg-stone-100">
-                  Hành động
+                  {t("bookedList.actions")}
                 </TableHeadCell>
               </TableHead>
 
@@ -100,20 +100,21 @@ export default function BookedListModal({
                         (id) =>
                           tables.find((t) => t.id === id)?.name || `(ID ${id})`
                       )
-                      .join(", ") || "(Không rõ)";
+                      .join(", ") || t("bookedList.unknownTable");
 
                   const statusColorMap: Record<string, string> = {
                     CONFIRMED: "text-green-700 bg-green-100",
                     PENDING: "text-yellow-700 bg-yellow-100",
                     CANCELLED: "text-red-700 bg-red-100",
-                    COMPLETED: "text-gray-700 bg-gray-200",
+                    COMPLETED: "text-blue-700 bg-blue-200",
                     DEFAULT: "text-blue-700 bg-blue-100",
                   };
                   const statusColorClass =
                     statusColorMap[res.statusName] || statusColorMap.DEFAULT;
 
                   const displayStatus =
-                    translateStatus(res.statusName) || "Đang xử lý";
+                    translateStatus(res.statusName) ||
+                    t("bookedList.status.processing");
 
                   return (
                     <TableRow
@@ -146,7 +147,9 @@ export default function BookedListModal({
                         <p className="flex items-center mb-1">
                           <HiOutlineUserGroup className="w-4 h-4 mr-1 text-green-500" />{" "}
                           {/* Icon HiOutlineUserGroup (Heroicons) */}
-                          <span className="font-medium mr-1">Số người:</span>
+                          <span className="font-medium mr-1">
+                            {t("bookedList.people")}:
+                          </span>
                           {res.numberOfPeople}
                         </p>
                         {res.note && (
@@ -170,23 +173,34 @@ export default function BookedListModal({
                       {/* Cột Hành động */}
                       <TableCell className="min-w-[150px]">
                         <div className="flex gap-2 justify-center">
-                          <Button
-                            size="sm"
-                            color="yellow"
-                            onClick={() => onEdit(res)}
-                            className="p-0 h-8 w-8 justify-center items-center"
-                            title="Chỉnh sửa">
-                            <HiOutlinePencil className="w-4 h-4" />
-                          </Button>
+                          {res.statusName !== "CANCELLED" &&
+                          res.statusName !== "COMPLETED" ? (
+                            <>
+                              <Button
+                                size="sm"
+                                color="yellow"
+                                onClick={() => onEdit(res)}
+                                className="p-0 h-8 w-8 justify-center items-center"
+                                title={t("bookedList.edit")}>
+                                <HiOutlinePencil className="w-4 h-4" />
+                              </Button>
 
-                          <Button
-                            size="sm"
-                            color="red"
-                            onClick={() => onCancel(res.publicId)}
-                            className="p-0 h-8 w-8 justify-center items-center"
-                            title="Hủy đặt bàn">
-                            <HiOutlineXMark className="w-4 h-4" />
-                          </Button>
+                              <Button
+                                size="sm"
+                                color="red"
+                                onClick={() => onCancel(res.publicId)}
+                                className="p-0 h-8 w-8 justify-center items-center"
+                                title={t("bookedList.cancel")}>
+                                <HiOutlineXMark className="w-4 h-4" />
+                              </Button>
+                            </>
+                          ) : (
+                            <span className="text-gray-400 italic text-sm">
+                              {res.statusName === "CANCELLED"
+                                ? t("bookedList.status.cancelled")
+                                : t("bookedList.status.completed")}
+                            </span>
+                          )}
                         </div>
                       </TableCell>
                     </TableRow>

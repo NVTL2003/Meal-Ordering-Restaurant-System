@@ -6,8 +6,11 @@ import { AxiosError } from "axios";
 import api from "../../api/axios";
 import { useAuth } from "../../store/AuthContext";
 import { useNotification } from "../../components/Notification/NotificationContext";
+import { useTranslation } from "react-i18next";
+import i18n from "i18next";
 
 export default function LoginForm() {
+  const { t } = useTranslation();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
@@ -15,6 +18,9 @@ export default function LoginForm() {
   const [errors, setErrors] = useState<{ email?: string; password?: string }>(
     {}
   );
+  const [showForgotModal, setShowForgotModal] = useState(false);
+  const [forgotEmail, setForgotEmail] = useState("");
+  const [forgotLoading, setForgotLoading] = useState(false);
   const navigate = useNavigate();
   const { refreshUser } = useAuth();
   const { notify } = useNotification();
@@ -23,16 +29,24 @@ export default function LoginForm() {
     e.preventDefault();
     const newErrors: typeof errors = {};
 
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      newErrors.email = "Invalid email format.";
+    // ===== Email validation =====
+    if (!email.trim()) {
+      newErrors.email = t("auth.login.error.requiredEmail");
+    } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      newErrors.email = t("auth.login.error.invalidEmailFormat");
     }
 
-    if (!email.includes("@")) {
-      newErrors.email = "Please enter a valid email.";
-    }
-
-    if (password.length < 8) {
-      newErrors.password = "Password must be at least 8 characters.";
+    // ===== Password validation =====
+    if (!password.trim()) {
+      newErrors.password = t("auth.login.error.requiredPassword");
+    } else if (password.length < 8) {
+      newErrors.password = t("auth.login.error.shortPassword");
+    } else if (!/[A-Z]/.test(password)) {
+      newErrors.password = t("auth.login.error.uppercaseRequired");
+    } else if (!/[0-9]/.test(password)) {
+      newErrors.password = t("auth.login.error.numberRequired");
+    } else if (!/[!@#$%^&*]/.test(password)) {
+      newErrors.password = t("auth.login.error.specialCharRequired");
     }
 
     setErrors(newErrors);
@@ -40,28 +54,35 @@ export default function LoginForm() {
     if (Object.keys(newErrors).length === 0) {
       try {
         setLoading(true);
-        // Gọi API login
         const response = await api.post(
           "/auth/login",
           { email, password },
-          { withCredentials: true } // quan trọng nếu backend trả HTTP-only cookie
+          {
+            withCredentials: true,
+            headers: {
+              "Accept-Language": i18n.language,
+            },
+          }
         );
 
         console.log("Login success:", response.data);
 
-        // Redirect sang dashboard hoặc trang chính
         navigate("/");
-        notify("success", "Login successful!");
+        notify("success", t("auth.login.success"));
         await refreshUser();
       } catch (error: unknown) {
         if (error instanceof AxiosError) {
-          notify(
-            "error",
-            error.response?.data.message || "Login failed. Please try again."
-          );
-          console.error("Login failed:", error.response?.data);
+          if (error.response?.data?.message) {
+            const msg = error.response.data.message;
+            setErrors({
+              email: msg,
+              password: msg,
+            });
+          } else {
+            notify("error", t("auth.login.failure"));
+          }
         } else {
-          notify("error", "An unexpected error occurred. Please try again.");
+          notify("error", t("auth.common.unexpectedError"));
           console.error("Unexpected error:", error);
         }
       } finally {
@@ -70,22 +91,46 @@ export default function LoginForm() {
     }
   };
 
+  const handleForgotSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+
+    if (!forgotEmail.trim()) {
+      notify("error", t("auth.forgot.error.emptyEmail"));
+    } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(forgotEmail)) {
+      notify("error", t("auth.forgot.error.invalidEmailFormat"));
+    } else {
+      try {
+        setForgotLoading(true);
+        await api.post("/auth/forgot-password", { email: forgotEmail });
+
+        notify("success", t("auth.forgot.success"));
+        setForgotEmail("");
+        setShowForgotModal(false);
+      } catch (error: unknown) {
+        console.error("Forgot password error:", error);
+        notify("error", t("auth.forgot.failure"));
+      } finally {
+        setForgotLoading(false);
+      }
+    }
+  };
+
   return (
     <div className="w-full h-full flex flex-col justify-center px-8">
       <h2 className="text-3xl font-bold text-white text-center mb-8">
-        Đăng nhập
+        {t("auth.login.title")}
       </h2>
+
       <form className="flex flex-col gap-6 w-full" onSubmit={handleSubmit}>
         {/* Email */}
         <div>
           <Label htmlFor="email" className="!text-gray-100">
-            Email
+            {t("auth.login.emailLabel")}
           </Label>
           <TextInput
             id="email"
             type="text"
-            placeholder="Enter your email"
-            required
+            placeholder={t("auth.login.emailPlaceholder")}
             color={errors.email ? "failure" : "gray"}
             value={email}
             onChange={(e) => setEmail(e.target.value)}
@@ -105,13 +150,12 @@ export default function LoginForm() {
         {/* Password */}
         <div className="relative">
           <Label htmlFor="password" className="!text-gray-100">
-            Password
+            {t("auth.login.passwordLabel")}
           </Label>
           <TextInput
             id="password"
             type={showPassword ? "text" : "password"}
             placeholder="••••••••"
-            required
             maxLength={20}
             color={errors.password ? "failure" : "gray"}
             value={password}
@@ -135,6 +179,15 @@ export default function LoginForm() {
           )}
         </div>
 
+        <div className="flex justify-end mt-1">
+          <button
+            type="button"
+            className="text-yellow-300 hover:text-yellow-400 text-sm"
+            onClick={() => setShowForgotModal(true)}>
+            {t("auth.login.forgotPassword")}
+          </button>
+        </div>
+
         {/* Submit */}
         <Button
           type="submit"
@@ -142,17 +195,51 @@ export default function LoginForm() {
           disabled={loading}
           fullSized>
           {loading && <Spinner size="sm" light={true} />}
-          {loading ? "Login..." : "Login"}
+          {loading ? t("auth.login.loading") : t("auth.login.submit")}
         </Button>
       </form>
 
       {/* Switch to Register */}
       <p className="text-sm text-gray-300 text-center mt-6">
-        Don’t have an account?{" "}
+        {t("auth.login.noAccount")}{" "}
         <Link to="/register" className="text-yellow-300 hover:text-yellow-400">
-          Register
+          {t("auth.login.registerLink")}
         </Link>
       </p>
+
+      {showForgotModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+          <div className="bg-stone-800 rounded-xl p-6 w-full max-w-md shadow-lg">
+            <h3 className="text-lg font-semibold mb-4">
+              {t("auth.forgot.title")}
+            </h3>
+            <form onSubmit={handleForgotSubmit} className="space-y-4">
+              <input
+                type="email"
+                placeholder={t("auth.forgot.emailPlaceholder")}
+                value={forgotEmail}
+                onChange={(e) => setForgotEmail(e.target.value)}
+                className="w-full p-3 border rounded-xl placeholder:text-gray-400 bg-stone-700 border-stone-600 text-white focus:ring-2 focus:ring-yellow-500"
+              />
+              <div className="flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowForgotModal(false)}
+                  className="py-2 px-4 rounded-xl bg-orange-500 hover:bg-orange-600"
+                  disabled={forgotLoading}>
+                  {t("common.cancel")}
+                </button>
+                <button
+                  type="submit"
+                  disabled={forgotLoading}
+                  className="py-2 px-4 rounded-xl bg-red-600 text-white hover:bg-red-700 disabled:opacity-50">
+                  {forgotLoading ? t("common.sending") : t("common.send")}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

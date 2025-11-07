@@ -1,51 +1,41 @@
 import React, { useState, useEffect, useCallback } from "react";
 import { useParams } from "react-router-dom";
 import { Card, Button, Spinner } from "flowbite-react";
-import { getAllMenuItems } from "../../../services/product/fetchProduct";
+import {
+  getAllMenuItems,
+  getMenuItemById,
+} from "../../../services/product/fetchProduct";
 import type { Product } from "../../../services/product/fetchProduct";
 import { useNotification } from "../../../components/Notification/NotificationContext";
 import ProductCard from "../../../components/card/ProductCard";
 import SearchBar from "../../../components/search_filter/SearchBar";
 import SortFilter from "../../../components/search_filter/SortFilter";
+import {
+  useRealtimeUpdate,
+  useRealtimeDelete,
+} from "../../../api/useRealtimeUpdate.ts";
+import { useTranslation } from "react-i18next";
+import { Link } from "react-router-dom";
 
 /**
  * 🍽️ MealPage
  * Trang hiển thị danh sách món ăn theo danh mục.
- * Hỗ trợ: tìm kiếm, sắp xếp, "xem thêm" (load more), và loading effect.
  */
 const MealPage: React.FC = () => {
   const { categorySlug } = useParams<{ categorySlug: string }>();
-
-  /** Danh sách sản phẩm hiển thị */
-  const [products, setProducts] = useState<Product[]>([]);
-
-  /** Tổng số trang do API trả về */
-  const [totalPages, setTotalPages] = useState(0);
-
-  /** Trang hiện tại (0-based) */
-  const [currentPage, setCurrentPage] = useState(0);
-
-  /** Số sản phẩm mỗi lần tải */
-  const [pageSize] = useState(6);
-
-  /** Từ khóa tìm kiếm */
-  const [search, setSearch] = useState("");
-
-  /** Kiểu sắp xếp */
-  const [sort, setSort] = useState("popular");
-
-  /** Loading: true khi đang gọi API */
-  const [loading, setLoading] = useState(true);
-
-  /** Loading phụ khi nhấn "Xem thêm" */
-  const [loadingMore, setLoadingMore] = useState(false);
-
+  const { t } = useTranslation();
   const { notify } = useNotification();
 
-  /**
-   * 🔄 fetchProducts — Gọi API lấy dữ liệu món ăn
-   * Dùng useCallback để tránh re-create khi render lại
-   */
+  const [products, setProducts] = useState<Product[]>([]);
+  const [totalPages, setTotalPages] = useState(0);
+  const [currentPage, setCurrentPage] = useState(0);
+  const [pageSize] = useState(6);
+  const [search, setSearch] = useState("");
+  const [sort, setSort] = useState("popular");
+  const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+
+  /** 🔄 fetchProducts — Gọi API lấy dữ liệu món ăn */
   const fetchProducts = useCallback(
     async (page: number, append = false) => {
       try {
@@ -71,26 +61,55 @@ const MealPage: React.FC = () => {
         setTotalPages(pageData.totalPages);
       } catch (error) {
         console.error("Error fetching menu items:", error);
-        notify("error", "Không thể tải danh sách món ăn");
+        notify("error", t("mealPage.notification.fetchError"));
       } finally {
         setLoading(false);
         setLoadingMore(false);
       }
     },
-    [categorySlug, pageSize, search, sort, notify]
+    [categorySlug, pageSize, search, sort, notify, t]
   );
 
-  /** 🧩 Tải lại dữ liệu khi categorySlug / search / sort / currentPage thay đổi */
   useEffect(() => {
     fetchProducts(currentPage, currentPage > 0);
   }, [categorySlug, currentPage, search, sort, fetchProducts]);
 
-  /** 🔁 Reset danh sách & quay về trang đầu khi filter thay đổi */
   useEffect(() => {
     setProducts([]);
     setCurrentPage(0);
     window.scrollTo({ top: 0, behavior: "smooth" });
   }, [search, sort, categorySlug]);
+
+  /** 🔁 Realtime updates */
+  useRealtimeUpdate(
+    `/topic/menu/new`,
+    getMenuItemById,
+    (updatedOrNewProduct) => {
+      if (!updatedOrNewProduct) return;
+      setProducts((prev) => {
+        const exists = prev.some((p) => p.id === updatedOrNewProduct.id);
+        if (exists) {
+          return prev.map((p) =>
+            p.id === updatedOrNewProduct.id ? updatedOrNewProduct : p
+          );
+        }
+        return [updatedOrNewProduct, ...prev];
+      });
+
+      notify(
+        "info",
+        t("mealPage.notification.itemUpdatedOrAdded", {
+          name: updatedOrNewProduct.name,
+        })
+      );
+    },
+    (msg: { menuItemId: number }) => msg.menuItemId
+  );
+
+  useRealtimeDelete<{ menuItemId: number }>("/topic/menu/delete", (msg) => {
+    setProducts((prev) => prev.filter((p) => p.id !== msg.menuItemId));
+    notify("warning", t("mealPage.notification.itemDeleted"));
+  });
 
   return (
     <section className="min-h-screen bg-gradient-to-b from-amber-50 to-stone-100 py-12 px-4 sm:px-6 md:px-8">
@@ -99,23 +118,25 @@ const MealPage: React.FC = () => {
         <h2 className="text-4xl font-extrabold text-center text-amber-800 mb-4 border-b-2 border-stone-800 pb-2">
           {categorySlug
             ? categorySlug
-                .replace("-", " ")
-                .replace(/\b\w/g, (c) => c.toUpperCase())
-            : "Danh sách món ăn"}
+                .replace(/-/g, " ")
+                .replace(/\p{L}/gu, (c, i) =>
+                  i === 0 || categorySlug[i - 1] === "-" ? c.toUpperCase() : c
+                )
+            : t("mealPage.title.default")}
         </h2>
 
         <p className="text-amber-600 text-lg text-center mb-8">
-          Khám phá các món ăn ngon nhất trong danh mục
+          {t("mealPage.description")}
         </p>
 
         {/* === Thanh tìm kiếm & bộ lọc === */}
         <Card className="mb-8 !bg-white !border-stone-400 shadow-sm">
-          <div className="flex flex-col md:flex-row justify-between gap-4 p-4 items-center">
-            <div className="w-full md:w-auto flex-1">
+          <div className="flex flex-col md:flex-row items-center justify-between gap-4 p-4">
+            <div className="flex-1 w-full md:w-auto">
               <SearchBar search={search} setSearch={setSearch} />
             </div>
 
-            <div className="mt-3 md:mt-0 md:ml-4 flex-none w-full md:w-auto">
+            <div className="w-full md:w-auto flex-none">
               <SortFilter
                 sort={sort}
                 setSort={setSort}
@@ -123,14 +144,12 @@ const MealPage: React.FC = () => {
               />
             </div>
 
-            <div className="mt-3 md:mt-0 md:ml-4 flex-none w-full md:w-auto">
-              <Button
-                color="warning"
-                size="md"
-                className="bg-amber-500 hover:bg-amber-600 text-white font-semibold shadow-lg transition-colors duration-200"
-                href="/menu">
-                Xem tất cả
-              </Button>
+            <div className="w-full md:w-auto flex-none">
+              <Link
+                to="/menu"
+                className="block w-full md:w-auto text-center bg-amber-500 hover:bg-amber-600 text-white font-semibold py-2 px-4 rounded-xl shadow-lg transition-colors duration-200">
+                {t("mealPage.actions.viewAll")}
+              </Link>
             </div>
           </div>
         </Card>
@@ -149,12 +168,12 @@ const MealPage: React.FC = () => {
                 ))
               : !loading && (
                   <div className="text-gray-500 text-center col-span-full">
-                    Không có món ăn nào trong danh mục này
+                    {t("mealPage.noItems")}
                   </div>
                 )}
           </div>
 
-          {/* Skeleton chỉ hiện khi load trang đầu */}
+          {/* Skeleton khi đang load trang đầu */}
           {loading && products.length === 0 && (
             <div className="absolute inset-0 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
               {Array.from({ length: pageSize }).map((_, idx) => (
@@ -177,10 +196,10 @@ const MealPage: React.FC = () => {
               className="bg-amber-500 hover:bg-amber-600 text-white font-semibold shadow-lg transition-colors duration-200 disabled:opacity-70">
               {loadingMore ? (
                 <span className="flex items-center gap-2">
-                  <Spinner size="sm" /> Đang tải...
+                  <Spinner size="sm" /> {t("mealPage.loadingMore")}
                 </span>
               ) : (
-                "Xem thêm"
+                t("mealPage.actions.loadMore")
               )}
             </Button>
           </div>

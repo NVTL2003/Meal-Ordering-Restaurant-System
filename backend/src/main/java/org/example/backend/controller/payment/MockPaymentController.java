@@ -1,17 +1,34 @@
 package org.example.backend.controller.payment;
 
 import lombok.RequiredArgsConstructor;
+import org.example.backend.dto.order.OrderMapper;
 import org.example.backend.dto.payment.PaymentDto;
+import org.example.backend.dto.payment.PaymentRequestDto;
+import org.example.backend.entity.menu.MenuItem;
 import org.example.backend.entity.order.Order;
 import org.example.backend.entity.param.Param;
 import org.example.backend.entity.payment.Payment;
+import org.example.backend.entity.user.ShippingInfo;
+import org.example.backend.entity.user.User;
+import org.example.backend.repository.menu.MenuItemRepository;
 import org.example.backend.repository.order.OrderRepository;
 import org.example.backend.repository.param.ParamRepository;
 import org.example.backend.repository.payment.PaymentRepository;
+import org.example.backend.repository.user.ShippingInfoRepository;
+import org.example.backend.service.menu.MenuItemService;
+import org.example.backend.service.notification.NotificationService;
+import org.example.backend.service.user.UserService;
+import org.example.backend.util.WebSocketNotifier;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
+import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.view.RedirectView;
 
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -23,6 +40,12 @@ public class MockPaymentController {
     private final PaymentRepository paymentRepository;
     private final OrderRepository orderRepository;
     private final ParamRepository paramRepository;
+    private final MenuItemRepository menuItemRepository;
+    private final ShippingInfoRepository shippingInfoRepository;
+    private final MenuItemService menuItemService;
+    private final UserService userService;
+    private final NotificationService notificationService;
+    private final WebSocketNotifier webSocketNotifier;
 
     /**
      * 1️⃣ Initiate payment (API FE gọi)
@@ -60,22 +83,51 @@ public class MockPaymentController {
      */
     @PostMapping("/approve/{publicId}")
     @PreAuthorize("isAuthenticated()")
-    public Map<String, String> approvePayment(@PathVariable String publicId) {
-        Payment payment = paymentRepository.findByPublicId(publicId).orElseThrow(() -> new RuntimeException("Payment not found"));
+    @Transactional
+    public Map<String, String> approvePayment(@PathVariable String publicId, @RequestBody PaymentRequestDto shipping) {
+        Payment payment = paymentRepository.findByPublicId(publicId)
+                .orElseThrow(() -> new RuntimeException("Payment not found"));
+
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        String email = auth.getName();
+        Long currentUser = userService.getUserByEmail(email).getId();
+
+        if (!payment.getOrder().getUser().getId().equals(currentUser)) {
+            throw new AccessDeniedException("Bạn không thể duyệt thanh toán của người khác");
+        }
 
         Param statusSuccess = paramRepository.findByTypeAndCode("PAYMENT_STATUS", "COMPLETED").orElseThrow();
+        Param orderPending = paramRepository.findByTypeAndCode("ORDER_STATUS", "PENDING").orElseThrow();
 
-        Param orderPaid = paramRepository.findByTypeAndCode("ORDER_STATUS", "PAID").orElseThrow();
-
-        // Update Payment & Order
+        // Update payment
         payment.setStatus(statusSuccess);
         payment.setTransactionId("MOCK-" + UUID.randomUUID());
         paymentRepository.save(payment);
 
+        // Update order
         Order order = payment.getOrder();
-        order.setStatus(orderPaid);
+        order.setStatus(orderPending);
         orderRepository.save(order);
 
+        // Tạo shipping info
+        ShippingInfo shippingInfo = new ShippingInfo();
+        shippingInfo.setPayment(payment);
+        shippingInfo.setFullName(shipping.getFullName());
+        shippingInfo.setEmail(shipping.getEmail());
+        shippingInfo.setPhone(shipping.getPhone());
+        shippingInfo.setAddress(shipping.getAddress());
+        shippingInfo.setNote(shipping.getNote());
+        shippingInfoRepository.save(shippingInfo);
+
+        // Giảm tồn kho
+        List<Long> affectedMenuIds = menuItemService.reduceInventory(order.getId());
+        for (Long id : affectedMenuIds) {
+            webSocketNotifier.notifyMenuItemStock(id);
+        }
+        webSocketNotifier.notifyNewOrderForAdmin(OrderMapper.toDto(order));
+        notificationService.notifyNewOrder(order);
+
+        // Chỉ trả redirectUrl
         return Map.of("redirectUrl", payment.getReturnUrl());
     }
 
@@ -87,18 +139,21 @@ public class MockPaymentController {
     public Map<String, String> cancelPayment(@PathVariable String publicId) {
         Payment payment = paymentRepository.findByPublicId(publicId).orElseThrow(() -> new RuntimeException("Payment not found"));
 
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        String email = auth.getName();
+        Long currentUser = userService.getUserByEmail(email).getId();
+
+        if (!payment.getOrder().getUser().getId().equals(currentUser)) {
+            throw new AccessDeniedException("Bạn không thể duyệt thanh toán của người khác");
+        }
+
         Param statusFailed = paramRepository.findByTypeAndCode("PAYMENT_STATUS", "FAILED").orElseThrow();
 
-        Param orderPaid = paramRepository.findByTypeAndCode("ORDER_STATUS", "FAILED").orElseThrow();
 
         // Update Payment
         payment.setStatus(statusFailed);
         payment.setTransactionId("MOCK-" + UUID.randomUUID());
         paymentRepository.save(payment);
-
-        Order order = payment.getOrder();
-        order.setStatus(orderPaid);
-        orderRepository.save(order);
 
         return Map.of("redirectUrl", "http://localhost:5173/payments/failed");
     }

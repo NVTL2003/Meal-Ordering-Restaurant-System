@@ -1,23 +1,33 @@
 package org.example.backend.service.category;
 
 import jakarta.transaction.Transactional;
+import lombok.RequiredArgsConstructor;
 import org.example.backend.dto.category.CategoryDTO;
+import org.example.backend.dto.category.CategorySearchRequest;
 import org.example.backend.entity.category.Categories;
 import org.example.backend.exception.ValidationException;
+import org.example.backend.util.WebSocketNotifier;
 import org.example.backend.validator.CategoryValidator;
 import org.example.backend.repository.category.CategoryRepository;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.util.List;
 import java.util.stream.Collectors;
 
 @Service
 @Transactional
+@RequiredArgsConstructor
 public class CategoryService {
+    private final CategoryRepository categoryRepository;
 
-    @Autowired
-    private CategoryRepository categoryRepository;
+    private final WebSocketNotifier webSocketNotifier;
 
     // Convert Entity -> DTO
     private CategoryDTO toDTO(Categories category) {
@@ -73,6 +83,15 @@ public class CategoryService {
 
         Categories category = new Categories();
         updateEntity(category, dto);
+
+        Categories saved = categoryRepository.save(category);
+
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                webSocketNotifier.notifyNewCategory(saved.getId(), saved.getName());
+            }
+        });
         return toDTO(categoryRepository.save(category));
     }
 
@@ -95,6 +114,9 @@ public class CategoryService {
         Categories category = categoryRepository.findById(id)
                 .orElseThrow(() -> new ValidationException("Category not found"));
         updateEntity(category, dto);
+        Categories saved = categoryRepository.save(category);
+        // 🔔 Gửi notify cập nhật
+        webSocketNotifier.notifyCategoryUpdated(saved.getId(), saved.getName());
         return toDTO(categoryRepository.save(category));
     }
 
@@ -103,12 +125,44 @@ public class CategoryService {
         Categories category = categoryRepository.findById(id)
                 .orElseThrow(() -> new ValidationException("Category not found"));
         categoryRepository.delete(category);
+        categoryRepository.delete(category);
+
+        // 🔔 Gửi notify xóa
+        webSocketNotifier.notifyCategoryDeleted(id);
     }
 
     // Get children by parentId
-    public List<CategoryDTO> getChildren(Long parentId) {
-        return categoryRepository.findByParentId(parentId).stream()
+    public List<CategoryDTO> getAllChildren(Long parentId) {
+        return categoryRepository.findAllDescendants(parentId)
+                .stream()
                 .map(this::toDTO)
                 .collect(Collectors.toList());
+    }
+
+
+    // Phân trang cơ bản
+    public Page<CategoryDTO> getAllCategoriesWithPagination(int page, int size, String sortBy, String sortDirection) {
+        Sort.Direction direction = sortDirection.equalsIgnoreCase("desc") ? Sort.Direction.DESC : Sort.Direction.ASC;
+        Pageable pageable = PageRequest.of(page, size, Sort.by(direction, sortBy));
+        
+        return categoryRepository.findAll(pageable)
+                .map(this::toDTO);
+    }
+
+    // Tìm kiếm và filter với phân trang
+    public Page<CategoryDTO> searchCategoriesWithPagination(CategorySearchRequest searchRequest, int page, int size) {
+        String sortBy = searchRequest.getSortBy() != null ? searchRequest.getSortBy() : "id";
+        String sortDirection = searchRequest.getSortDirection() != null ? searchRequest.getSortDirection() : "asc";
+        
+        Sort.Direction direction = sortDirection.equalsIgnoreCase("desc") ? Sort.Direction.DESC : Sort.Direction.ASC;
+        Pageable pageable = PageRequest.of(page, size, Sort.by(direction, sortBy));
+        
+        return categoryRepository.findCategoriesWithFilters(
+                searchRequest.getName(),
+                searchRequest.getDescription(),
+                searchRequest.getParentId(),
+                searchRequest.getHasParent(),
+                pageable
+        ).map(this::toDTO);
     }
 }

@@ -2,6 +2,7 @@ package org.example.backend.service.user;
 
 import com.cloudinary.Cloudinary;
 import com.cloudinary.utils.ObjectUtils;
+import lombok.RequiredArgsConstructor;
 import org.example.backend.dto.user.UserDTO;
 import org.example.backend.entity.param.Param;
 import org.example.backend.entity.user.User;
@@ -13,12 +14,14 @@ import org.example.backend.validator.UserValidator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.MessageSource;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
+import java.time.LocalDateTime;
 import java.util.*;
 import java.util.stream.Collectors;
 import org.springframework.data.domain.Page;
@@ -26,6 +29,7 @@ import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
 
 @Service
+@RequiredArgsConstructor
 public class UserService {
     private static final Logger logger = LoggerFactory.getLogger(UserService.class);
     private static final long MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
@@ -33,20 +37,27 @@ public class UserService {
         "image/jpeg", "image/png", "image/gif"
     );
 
-    @Autowired
-    private UserRepository userRepository;
+    private final UserRepository userRepository;
 
-    @Autowired
-    private ParamRepository paramRepository;
+    private final ParamRepository paramRepository;
 
-    @Autowired
-    private PasswordEncoder passwordEncoder;
+    private final PasswordEncoder passwordEncoder;
 
-    @Autowired
-    private JwtUtil jwtUtil;
+    private final MessageSource messageSource;
 
-    @Autowired
-    private Cloudinary cloudinary;
+    private final JwtUtil jwtUtil;
+
+    private final Cloudinary cloudinary;
+
+    private final Map<String, ResetToken> resetTokens = new HashMap<>();
+
+    private String getMessage(String code, Object[] args, Locale locale) {
+        return messageSource.getMessage(code, args, locale);
+    }
+
+    private String getMessage(String code, Locale locale) {
+        return messageSource.getMessage(code, null, locale);
+    }
 
     private boolean isValidImageType(String contentType) {
         return contentType != null && ALLOWED_IMAGE_TYPES.contains(contentType.toLowerCase());
@@ -305,6 +316,47 @@ public class UserService {
         return jwtUtil.generateToken(user.getEmail(), user.getRole().getCode(), user.getName(), user.getPublicId());
     }
 
+    @Transactional
+    public void changePassword(String email, String currentPassword, String newPassword,Locale locale) {
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new RuntimeException(getMessage("user.error.notFound", new Object[]{email}, locale)));
+
+        // ✅ 1. Kiểm tra mật khẩu hiện tại
+        if (!passwordEncoder.matches(currentPassword, user.getPasswordHash())) {
+            throw new RuntimeException(getMessage("password.error.currentIncorrect", null, locale));
+        }
+
+        // ✅ 2. Không cho phép trùng mật khẩu cũ
+        if (passwordEncoder.matches(newPassword, user.getPasswordHash())) {
+            throw new RuntimeException(getMessage("password.error.sameAsOld", null, locale));
+        }
+
+        // ✅ 3. Kiểm tra độ mạnh mật khẩu
+        validatePasswordStrength(newPassword, locale);
+
+        // ✅ 4. Cập nhật mật khẩu mới (hash)
+        user.setPasswordHash(passwordEncoder.encode(newPassword));
+        userRepository.save(user);
+    }
+
+    private void validatePasswordStrength(String password, Locale locale) {
+        if (password.length() < 8) {
+            throw new RuntimeException(getMessage("password.error.minLength", new Object[]{8}, locale));
+        }
+        if (!password.matches(".*[A-Z].*")) {
+            throw new RuntimeException(getMessage("password.error.uppercaseRequired", null, locale));
+        }
+        if (!password.matches(".*[a-z].*")) {
+            throw new RuntimeException(getMessage("password.error.lowercaseRequired", null, locale));
+        }
+        if (!password.matches(".*\\d.*")) {
+            throw new RuntimeException(getMessage("password.error.numberRequired", null, locale));
+        }
+        if (!password.matches(".*[!@#$%^&*()_+\\-={}\\[\\]|;:'\",.<>/?].*")) {
+            throw new RuntimeException(getMessage("password.error.specialCharRequired", null, locale));
+        }
+    }
+
     public UserDTO getUserById(Long id) {
         User user = userRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("User not found with id: " + id));
@@ -487,7 +539,8 @@ public class UserService {
 
         user.setName(userDTO.getName());
         user.setEmail(userDTO.getEmail());
-        user.setAvatarUrl(userDTO.getAvatarUrl());
+        user.setPhone(userDTO.getPhone());
+        user.setAddress(userDTO.getAddress());
 
         if (userDTO.getGender() != null) {
             Param gender = paramRepository.findByTypeAndCode("GENDER", userDTO.getGender()).get();
@@ -496,6 +549,40 @@ public class UserService {
 
         userRepository.save(user);
         return convertToDTO(user);
+    }
+
+    public String generateResetToken(String email) {
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new RuntimeException("Không tìm thấy người dùng"));
+
+        String token = UUID.randomUUID().toString();
+        resetTokens.put(token, new ResetToken(email, LocalDateTime.now().plusMinutes(10)));
+        return token;
+    }
+
+    public void resetPassword(String token, String newPassword) {
+        ResetToken resetToken = resetTokens.get(token);
+        if (resetToken == null || resetToken.getExpiry().isBefore(LocalDateTime.now())) {
+            throw new RuntimeException("Token không hợp lệ hoặc đã hết hạn");
+        }
+
+        User user = userRepository.findByEmail(resetToken.getEmail())
+                .orElseThrow(() -> new RuntimeException("Không tìm thấy người dùng"));
+        user.setPasswordHash(passwordEncoder.encode(newPassword));
+        userRepository.save(user);
+
+        resetTokens.remove(token); // Xóa token sau khi dùng
+    }
+
+    private static class ResetToken {
+        private String email;
+        private LocalDateTime expiry;
+        public ResetToken(String email, LocalDateTime expiry) {
+            this.email = email;
+            this.expiry = expiry;
+        }
+        public String getEmail() { return email; }
+        public LocalDateTime getExpiry() { return expiry; }
     }
 
     private UserDTO convertToDTO(User user) {

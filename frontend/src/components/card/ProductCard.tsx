@@ -1,51 +1,87 @@
-import React from "react";
+import React, { useState } from "react";
 import { Button, Badge } from "flowbite-react";
 import { HiEye, HiShoppingCart } from "react-icons/hi";
 import { FaStar, FaStarHalf } from "react-icons/fa";
 import type { Product } from "../../services/product/fetchProduct";
+import { getMenuItemById } from "../../services/product/fetchProduct";
 import { useNotification } from "../Notification/NotificationContext";
+import { useCart } from "../../store/CartContext";
 import {
   getCurrentCart,
   createCart,
   addItemToCart,
 } from "../../services/cart/cartService";
+import { useRealtimeUpdate } from "../../api/useRealtimeUpdate";
+import { useTranslation } from "react-i18next";
 
 interface ProductCardProps {
   product: Product;
 }
 
 const ProductCard: React.FC<ProductCardProps> = ({ product }) => {
+  const { t } = useTranslation();
   const { notify } = useNotification();
+  const { fetchCart } = useCart();
+
+  const [currentProduct, setCurrentProduct] = useState(product);
+
+  useRealtimeUpdate(
+    `/topic/menu/${product?.id}`,
+    getMenuItemById,
+    (updated) => {
+      if (updated) {
+        setCurrentProduct(updated);
+        notify("info", t("productCard.updated", { name: updated.name }));
+      }
+    },
+    (msg: { menuItemId: number }) => msg.menuItemId
+  );
+
+  useRealtimeUpdate(
+    `/topic/menu/update`,
+    getMenuItemById,
+    (updatedProduct) => {
+      if (!updatedProduct || updatedProduct.id !== currentProduct?.id) return;
+      setCurrentProduct(updatedProduct);
+      notify(
+        "info",
+        t("mealPage.notification.itemUpdated", { name: updatedProduct.name })
+      );
+    },
+    (msg: { menuItemId: number }) => msg.menuItemId
+  );
 
   const handleAddToCart = async () => {
-    if (product.status !== "AVAILABLE") {
-      notify("error", `${product.name} hiện không có sẵn`);
+    if (currentProduct.status !== "AVAILABLE") {
+      notify(
+        "error",
+        t("productCard.notAvailable", { name: currentProduct.name })
+      );
       return;
     }
 
     try {
-      // Lấy cart hiện tại
       const cart = await getCurrentCart().catch(() => createCart());
-
-      // Thêm item vào cart
-      const updatedCart = await addItemToCart(cart.id, {
-        menuItemId: product.id,
+      await addItemToCart(cart.id, {
+        menuItemId: currentProduct.id,
         quantity: 1,
       });
 
-      notify("success", `Đã thêm ${product.name} vào giỏ hàng`);
-      console.log("Updated cart:", updatedCart);
+      notify(
+        "success",
+        t("productCard.addedToCart", { name: currentProduct.name })
+      );
+      await fetchCart();
     } catch (error) {
-      notify("error", "Lỗi khi thêm vào giỏ hàng");
+      notify("error", t("productCard.addToCartError"));
       console.error(error);
     }
   };
 
-  const averageRating =
-    product?.reviews && product.reviews.length > 0
-      ? product.reviews.reduce((sum, r) => sum + r.rating, 0) /
-        product.reviews.length
-      : product?.rating ?? 0;
+  const averageRating = product?.reviews?.length
+    ? product.reviews.reduce((sum, r) => sum + r.rating, 0) /
+      product.reviews.length
+    : product?.rating ?? 0;
 
   const isNew =
     new Date(product.createdAt) >
@@ -60,7 +96,7 @@ const ProductCard: React.FC<ProductCardProps> = ({ product }) => {
   return (
     <div
       className={`p-4 bg-white rounded-lg shadow-md hover:shadow-xl group-hover:-translate-y-1 transition-all duration-300 group border border-stone-200 hover:border-yellow-400 animate-fadeIn ${
-        product.status !== "AVAILABLE" ? "opacity-70" : ""
+        currentProduct.status !== "AVAILABLE" ? "opacity-70" : ""
       }`}>
       <div className="relative">
         {product.avatarUrl ? (
@@ -71,27 +107,30 @@ const ProductCard: React.FC<ProductCardProps> = ({ product }) => {
           />
         ) : (
           <div className="w-full h-48 bg-gray-200 rounded-lg mb-4 flex items-center justify-center text-gray-500">
-            Không có hình ảnh
+            {t("productCard.noImage")}
           </div>
         )}
+
         <span
           className={`absolute top-2 left-2 ${
-            statusColors[product.status]
+            statusColors[currentProduct.status]
           } text-white text-sm px-2 py-1 rounded animate-pulse`}>
-          {product.status === "AVAILABLE"
-            ? "Có sẵn"
-            : product.status === "OUT_OF_STOCK"
-            ? "Hết hàng"
-            : "Sắp ra mắt"}
+          {currentProduct.status === "AVAILABLE"
+            ? t("productCard.available")
+            : currentProduct.status === "OUT_OF_STOCK"
+            ? t("productCard.outOfStock")
+            : t("productCard.comingSoon")}
         </span>
+
         {isNew && (
           <span className="absolute top-10 left-2 bg-blue-500 text-white text-sm px-2 py-1 rounded animate-pulse">
-            Mới
+            {t("productCard.new")}
           </span>
         )}
       </div>
+
       <h3 className="text-2xl font-bold bg-gradient-to-r from-gray-800 to-gray-600 bg-clip-text text-transparent mb-2 line-clamp-1">
-        {product.name}
+        {currentProduct.name}
       </h3>
 
       <div className="flex items-center mb-2">
@@ -113,25 +152,36 @@ const ProductCard: React.FC<ProductCardProps> = ({ product }) => {
       </div>
 
       <p className="text-gray-600 text-base mb-2 line-clamp-2">
-        {product.description || "Món ăn ngon, đang chờ bạn khám phá!"}
+        {product.description || t("productCard.defaultDescription")}
       </p>
+
       <div className="flex gap-2 mb-2">
         <Badge color="warning" size="sm">
           {product.categorySlug
-            .replace("-", " ")
-            .replace(/\b\w/g, (c) => c.toUpperCase())}
+            ? product.categorySlug
+                .replace(/-/g, " ")
+                .replace(/\p{L}/gu, (c, i, str) =>
+                  i === 0 || str[i - 1] === " "
+                    ? c.toUpperCase()
+                    : c.toLowerCase()
+                )
+            : "Default"}
         </Badge>
+
         {product.tags?.map((tag) => (
           <Badge key={tag} color="info" size="sm">
             {tag}
           </Badge>
         ))}
       </div>
+
       <p className="text-yellow-600 font-medium group-hover:text-yellow-700 mb-2">
-        {product.price.toLocaleString("vi-VN")} VNĐ
+        {product.price.toLocaleString("vi-VN")} {t("productCard.currency")}
       </p>
 
-      <p className="text-gray-500 text-sm mb-2">Đã bán {product.sold ?? 0}+</p>
+      <p className="text-gray-500 text-sm mb-2">
+        {t("productCard.sold", { count: product.sold ?? 0 })}
+      </p>
 
       <div className="flex justify-between gap-2 mt-4">
         <Button
@@ -140,20 +190,20 @@ const ProductCard: React.FC<ProductCardProps> = ({ product }) => {
           href={`/menu/product/${product.id}`}
           className="hover:bg-yellow-500 hover:scale-105 transition-transform duration-200 flex-1">
           <HiEye className="mr-2 h-5 w-5" />
-          Xem
+          {t("productCard.view")}
         </Button>
         <Button
           color="success"
           size="lg"
           onClick={handleAddToCart}
-          disabled={product.status !== "AVAILABLE"}
+          disabled={currentProduct.status !== "AVAILABLE"}
           className={`text-white bg-gradient-to-r from-green-600 to-green-700 hover:from-green-700 hover:to-green-800 hover:scale-105 transition-transform duration-200 flex-1 ${
-            product.status !== "AVAILABLE"
+            currentProduct.status !== "AVAILABLE"
               ? "opacity-50 cursor-not-allowed"
               : ""
           }`}>
           <HiShoppingCart className="mr-2 h-5 w-5" />
-          Thêm
+          {t("productCard.add")}
         </Button>
       </div>
     </div>

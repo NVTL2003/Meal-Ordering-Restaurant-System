@@ -1,19 +1,24 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useMemo, useCallback } from "react";
 import { Button, Spinner, Tooltip } from "flowbite-react";
 import { getAllTables } from "../../../services/table/tableService";
 import type { TableEntity } from "../../../services/table/tableService";
 import BookingModal, { type BookingData } from "./BookingModal";
-import ConfirmDialog from "../../../components/common/ConfirmDialogProps ";
+import ConfirmDialog from "../../../components/common/ConfirmDialogProps";
 import {
   createMyReservation,
   getMyReservations,
-  deleteMyReservation,
   getMyReservationByPublicId,
   updateMyReservation,
 } from "../../../services/reservation/reservationService";
 import type { Reservation } from "../../../services/reservation/reservationService";
 import BookedListModal from "./BookedListModal";
 import { useNotification } from "../../../components/Notification/NotificationContext";
+import { connectWebSocket } from "../../../api/websocketClient";
+import {
+  useRealtimeUpdate,
+  useRealtimeDelete,
+} from "../../../api/useRealtimeUpdate";
+import { useTranslation } from "react-i18next";
 
 /** ================================
  *  COMPONENT: TableBooking
@@ -23,25 +28,50 @@ export default function TableBooking() {
   /** -------------------------------
    *  STATE MANAGEMENT
    *  ------------------------------- */
+  const { t } = useTranslation();
   const [tables, setTables] = useState<TableEntity[]>([]);
+  const [page] = useState(0);
+  const [, setTotalPages] = useState(0);
   const [selectedTable, setSelectedTable] = useState<TableEntity | null>(null);
   const [loading, setLoading] = useState(true);
-  const [openModal, setOpenModal] = useState(false);
   const [showBookedList, setShowBookedList] = useState(false);
   const [selectedArea, setSelectedArea] = useState<string>("ALL");
-  const [showBookingModal, setShowBookingModal] = useState(false);
   const [editingReservation, setEditingReservation] =
     useState<Reservation | null>(null);
 
+  type BookingMode = "create" | "edit" | null;
+  const [bookingModalState, setBookingModalState] = useState<BookingMode>(null);
   const [showConfirm, setShowConfirm] = useState(false);
   const [targetPublicId, setTargetPublicId] = useState<string | null>(null);
 
   const [myReservations, setMyReservations] = useState<Reservation[]>([]);
+  const activeReservations = useMemo(
+    () =>
+      myReservations.filter(
+        (res) =>
+          res.statusName !== "CANCELLED" && res.statusName !== "COMPLETED"
+      ),
+    [myReservations]
+  );
+
   const [loadingReservations, setLoadingReservations] = useState(false);
   const { notify } = useNotification();
 
   /** Danh sách ID bàn mà user đã đặt */
-  const myBookedTableIds = myReservations.flatMap((res) => res.tableIds || []);
+  const myBookedStatusMap = useMemo(() => {
+    const map: Record<number, string> = {};
+    myReservations
+      .filter(
+        (res) =>
+          res.statusName !== "CANCELLED" && res.statusName !== "COMPLETED"
+      )
+      .forEach((res) => {
+        (res.tableIds || []).forEach((id) => {
+          map[id] = res.statusName; // PENDING hoặc CONFIRMED
+        });
+      });
+    return map;
+  }, [myReservations]);
 
   /** -------------------------------
    *  DATE TIME LIMIT (chỉ cho phép đặt từ thời điểm hiện tại)
@@ -53,16 +83,89 @@ export default function TableBooking() {
    *  DATA FETCHING
    *  ------------------------------- */
   useEffect(() => {
-    const fetchData = async () => {
-      setLoading(true);
-      await Promise.all([fetchTables(), fetchMyReservations()]);
-      setLoading(false);
+    const client = connectWebSocket<{ tableId: number; statusId: number }>(
+      "/topic/tables",
+      (update) => {
+        setTables((prev) =>
+          prev.map((t) =>
+            t.id === update.tableId
+              ? {
+                  ...t,
+                  statusId: update.statusId,
+                  statusName: getStatusNameFromId(update.statusId),
+                }
+              : t
+          )
+        );
+      }
+    );
+
+    return () => {
+      // gọi async nhưng không trả về Promise cho useEffect
+      client.deactivate();
     };
-    fetchData();
   }, []);
 
+  useRealtimeUpdate<Reservation, string, { reservationPublicId: string }>(
+    "/topic/reservations",
+    async (id) => {
+      console.log("🔄 Fetching reservation by publicId:", id);
+      const res = await getMyReservationByPublicId(id);
+      console.log("✅ Fetched reservation:", res);
+      if (!res) throw new Error("Reservation not found");
+      return res;
+    },
+    async (data) => {
+      console.log("📡 onUpdate triggered with:", data);
+      await fetchMyReservations();
+      await fetchTables();
+      console.log("✅ Refetched reservations and tables");
+    },
+    (msg) => {
+      console.log("📩 WS message received:", msg);
+      return msg.reservationPublicId;
+    }
+  );
+
+  // 🧾 Realtime: khi có bàn mới được thêm
+  useRealtimeUpdate<TableEntity, number, { tableId: number }>(
+    "/topic/tables/new",
+    async (id) => {
+      const all = await getAllTables();
+      return all.find((t) => t.id === id)!;
+    },
+    (newTable) => {
+      setTables((prev) => {
+        // tránh thêm trùng
+        if (prev.some((t) => t.id === newTable.id)) return prev;
+        return [...prev, newTable];
+      });
+    },
+    (msg) => msg.tableId
+  );
+
+  // ✏️ Realtime: khi bàn được cập nhật
+  useRealtimeUpdate<TableEntity, number, { tableId: number }>(
+    "/topic/tables/update",
+    async (id) => {
+      const all = await getAllTables();
+      return all.find((t) => t.id === id)!;
+    },
+    (updatedTable) => {
+      setTables((prev) =>
+        prev.map((t) => (t.id === updatedTable.id ? updatedTable : t))
+      );
+    },
+    (msg) => msg.tableId
+  );
+
+  // 🗑️ Realtime: khi bàn bị xóa
+  useRealtimeDelete<{ tableId: number }>("/topic/tables/delete", (msg) => {
+    setTables((prev) => prev.filter((t) => t.id !== msg.tableId));
+  });
+
   /** Lấy danh sách bàn */
-  const fetchTables = async () => {
+  const fetchTables = useCallback(async () => {
     try {
       const data = await getAllTables();
       setTables(data);
@@ -70,28 +173,44 @@ export default function TableBooking() {
       console.error("❌ Lỗi tải danh sách bàn:", error);
       notify("error", "Không thể tải danh sách bàn!");
     }
-  };
+  }, [notify]);
 
   /** Lấy danh sách bàn đã đặt của user */
-  const fetchMyReservations = async () => {
+  const fetchMyReservations = useCallback(async () => {
     setLoadingReservations(true);
     try {
-      const data = await getMyReservations();
-      setMyReservations(data || []);
+      const data = await getMyReservations(page, 10);
+      setMyReservations(data?.content || []);
+      setTotalPages(data?.totalPages ?? 0);
     } catch (error) {
       console.error("❌ Lỗi khi tải danh sách đặt bàn:", error);
       notify("error", "Không thể tải danh sách đặt bàn!");
     } finally {
       setLoadingReservations(false);
     }
-  };
+  }, [notify, page]);
+
+  useEffect(() => {
+    const fetchData = async () => {
+      setLoading(true);
+      await Promise.all([fetchTables(), fetchMyReservations()]);
+      setLoading(false);
+    };
+    fetchData();
+  }, [fetchMyReservations, fetchTables]);
 
   const handleEditReservation = async (res: Reservation) => {
     const fullReservation = await getMyReservationByPublicId(res.publicId);
-    console.log(fullReservation);
     if (fullReservation) {
       setEditingReservation(fullReservation);
-      setShowBookingModal(true);
+      // ✅ Nếu reservation có tableIds (hoặc tables)
+      if (fullReservation.tableIds && fullReservation.tableIds.length > 0) {
+        const firstTableId = fullReservation.tableIds[0]; // hoặc chọn nhiều bàn nếu hỗ trợ multi
+        // Nếu bạn có danh sách tất cả bàn (tables) ở state, có thể tìm ra đối tượng
+        const table = tables.find((t) => t.id === firstTableId);
+        setSelectedTable(table || null);
+      }
+      setBookingModalState("edit");
     }
   };
 
@@ -111,17 +230,18 @@ export default function TableBooking() {
         editingReservation.publicId,
         payload
       );
+
       if (updated) {
-        notify("success", "✅ Cập nhật đặt bàn thành công!");
+        notify("success", t("table.notify.updateSuccess"));
         await fetchMyReservations();
-        setShowBookingModal(false);
+        setBookingModalState(null);
         setEditingReservation(null);
       } else {
-        notify("error", "Không thể cập nhật đặt bàn!");
+        notify("error", t("table.notify.updateFail"));
       }
     } catch (error) {
       console.error("❌ Lỗi khi cập nhật đặt bàn:", error);
-      notify("error", "Có lỗi xảy ra khi lưu thay đổi!");
+      notify("error", t("table.notify.updateFail"));
     } finally {
       setLoading(false);
     }
@@ -138,16 +258,15 @@ export default function TableBooking() {
     setShowConfirm(false);
     setLoading(true);
     try {
-      const success = await deleteMyReservation(targetPublicId);
-      if (success) {
-        notify("success", "Đã hủy đặt bàn thành công!");
-        await fetchMyReservations(); // refresh danh sách
-      } else {
-        notify("error", "Hủy đặt bàn thất bại!");
-      }
+      // 🔁 Cập nhật trạng thái thành CANCELLED
+      await updateMyReservation(targetPublicId, { statusName: "CANCELLED" });
+
+      notify("success", t("table.notify.updateSuccess"));
+      // 🔁 Làm mới dữ liệu
+      await Promise.all([fetchTables(), fetchMyReservations()]);
     } catch (error) {
       console.error("❌ Lỗi khi hủy đặt bàn:", error);
-      notify("error", "Có lỗi xảy ra khi hủy đặt bàn!");
+      notify("error", t("table.notify.updateFail"));
     } finally {
       setLoading(false);
       setTargetPublicId(null);
@@ -157,34 +276,14 @@ export default function TableBooking() {
   /** -------------------------------
    *  TRANSLATION HELPERS
    *  ------------------------------- */
-  const translateLocation = (location: string) =>
-    ({
-      MAIN_HALL: "Sảnh chính",
-      VIP_ROOM: "Phòng VIP",
-      OUTDOOR: "Ngoài trời",
-      GARDEN: "Khu vườn",
-      PRIVATE_ROOM: "Phòng riêng",
-      BAR_AREA: "Quầy bar",
-    }[location] || location);
+  const translateLocation = (location: string): string =>
+    t(`tableTranslations.location.${location}`, { defaultValue: location });
 
-  const translatePosition = (position: string) =>
-    ({
-      CENTER: "Giữa sảnh",
-      FAMILY: "Gia đình",
-      GOOD_VIEW: "Cảnh đẹp",
-      BAR: "Quầy bar",
-      VIP: "Khu vực VIP",
-      PERSONAL: "Cá nhân/riêng tư",
-    }[position] || position);
+  const translatePosition = (position: string): string =>
+    t(`tableTranslations.position.${position}`, { defaultValue: position });
 
-  const translateStatus = (status: string) =>
-    ({
-      AVAILABLE: "Còn trống",
-      OCCUPIED: "Đang sử dụng",
-      CONFIRMED: "Đã duyệt",
-      PENDING: "Đang chờ duyệt",
-      CANCELLED: "Đã hủy",
-    }[status] || status);
+  const translateStatus = (status: string): string =>
+    t(`tableTranslations.status.${status}`, { defaultValue: status });
 
   /** -------------------------------
    *  EVENT HANDLERS
@@ -193,7 +292,7 @@ export default function TableBooking() {
   /** Mở modal đặt bàn */
   const handleBookTable = (table: TableEntity) => {
     setSelectedTable(table);
-    setOpenModal(true);
+    setBookingModalState("create");
   };
 
   /** Xác nhận đặt bàn */
@@ -214,16 +313,20 @@ export default function TableBooking() {
       if (response) {
         notify(
           "success",
-          `Đã đặt bàn ${selectedTable.name} thành công vào lúc ${data.reservationTime}!`
+          t("table.notify.bookingSuccess", {
+            table: selectedTable.name,
+            time: data.reservationTime,
+          })
         );
-        setOpenModal(false);
-        await fetchMyReservations(); // cập nhật danh sách sau khi đặt
+
+        setBookingModalState(null);
+        await fetchMyReservations();
       } else {
-        notify("error", "Không thể đặt bàn, vui lòng thử lại!");
+        notify("error", t("table.notify.bookingFail"));
       }
     } catch (error) {
       console.error("❌ Lỗi khi gọi API đặt bàn:", error);
-      notify("error", "⚠️ Có lỗi xảy ra khi đặt bàn!");
+      notify("error", t("table.notify.bookingFail"));
     } finally {
       setLoading(false);
     }
@@ -251,6 +354,84 @@ export default function TableBooking() {
   const areas = ["ALL", ...new Set(tables.map((t) => t.locationName))];
 
   /** -------------------------------
+   *  SUB COMPONENTS & HELPERS
+   *  ------------------------------- */
+
+  /** Chú thích màu */
+  function Legend({ color, label }: { color: string; label: string }) {
+    const colorMap: Record<string, string> = {
+      green: "bg-green-100 border-green-300",
+      red: "bg-red-200 border-red-400",
+      blue: "bg-blue-200 border-blue-400",
+      yellow: "bg-yellow-200 border-yellow-400",
+    };
+    return (
+      <div className="flex items-center gap-1">
+        <span
+          className={`w-4 h-4 rounded-full border ${colorMap[color]}`}></span>
+        <span>{label}</span>
+      </div>
+    );
+  }
+
+  /** Helper xác định class & status text theo trạng thái bàn */
+  function getTableStatusClass(
+    table: TableEntity,
+    myStatus: string | undefined,
+    isOtherBooked: boolean,
+    translateStatus: (s: string) => string
+  ) {
+    if (myStatus === "CONFIRMED") {
+      return {
+        colorClass:
+          "bg-blue-100 border-blue-400 text-blue-800 cursor-not-allowed",
+        statusText: t("table.status.myConfirmed"),
+      };
+    }
+
+    if (myStatus === "PENDING") {
+      return {
+        colorClass:
+          "bg-yellow-200 border-yellow-400 text-yellow-800 cursor-not-allowed",
+        statusText: t("table.status.myPending"),
+      };
+    }
+
+    if (isOtherBooked) {
+      return {
+        colorClass:
+          "bg-red-200 border-red-400 text-gray-600 cursor-not-allowed",
+        statusText: t("table.status.booked"),
+      };
+    }
+
+    if (table.statusName === "AVAILABLE") {
+      return {
+        colorClass:
+          "bg-green-100 border-green-300 hover:bg-green-200 text-green-800 hover:shadow-md",
+        statusText: t("table.status.available"),
+      };
+    }
+
+    return {
+      colorClass:
+        "bg-gray-200 border-gray-300 text-gray-500 cursor-not-allowed",
+      statusText: translateStatus(table.statusName),
+    };
+  }
+
+  function getStatusNameFromId(statusId: number) {
+    switch (statusId) {
+      case 11:
+        return "AVAILABLE";
+      case 12:
+        return "OCCUPIED";
+      default:
+        return "AVAILABLE";
+    }
+  }
+
+  /** -------------------------------
    *  RENDER UI
    *  ------------------------------- */
   return (
@@ -258,7 +439,9 @@ export default function TableBooking() {
       <div className="max-w-screen-xl mx-auto bg-white p-8 md:p-10 shadow-lg rounded-xl">
         {/* === HEADER === */}
         <header className="mb-8 border-b pb-3">
-          <h1 className="text-3xl font-bold text-gray-800 mb-6">Đặt bàn</h1>
+          <h1 className="text-3xl font-bold text-gray-800 mb-6">
+            {t("table.header.title")}
+          </h1>
 
           {loading ? (
             <div className="flex justify-center items-center min-h-[50vh]">
@@ -277,7 +460,7 @@ export default function TableBooking() {
                       size="sm"
                       onClick={() => setSelectedArea(area)}>
                       {area === "ALL"
-                        ? "Tất cả khu vực"
+                        ? t("table.filter.allAreas")
                         : translateLocation(area)}
                     </Button>
                   ))}
@@ -287,19 +470,20 @@ export default function TableBooking() {
                 <div className="flex gap-4 items-center">
                   <div className="text-sm flex gap-4 p-2 rounded-lg bg-gray-50 border">
                     <p>
-                      Trống:{" "}
+                      {t("table.count.available")}:{" "}
                       <span className="font-bold text-green-600">
                         {availableCount}
                       </span>
                     </p>
                     <p>
-                      Đã đặt:{" "}
+                      {t("table.count.booked")}:{" "}
                       <span className="font-bold text-red-600">
                         {bookedCount}
                       </span>
                     </p>
                     <p>
-                      Tổng: <span className="font-bold">{tables.length}</span>
+                      {t("table.count.total")}:{" "}
+                      <span className="font-bold">{tables.length}</span>
                     </p>
                   </div>
                   <Button
@@ -309,17 +493,20 @@ export default function TableBooking() {
                       setShowBookedList(true);
                       fetchMyReservations();
                     }}>
-                    Xem bàn đã đặt
+                    {t("table.button.viewBooked")}
                   </Button>
                 </div>
               </div>
 
               {/* Chú thích */}
               <div className="mt-4 flex flex-wrap gap-4 text-sm text-gray-700 items-center">
-                <span className="font-semibold mr-2">Chú thích:</span>
-                <Legend color="green" label="Còn trống" />
-                <Legend color="red" label="Đã được đặt" />
-                <Legend color="blue" label="Bàn của tôi" />
+                <span className="font-semibold mr-2">
+                  {t("table.legend.title")}:
+                </span>
+                <Legend color="green" label={t("table.legend.available")} />
+                <Legend color="red" label={t("table.legend.booked")} />
+                <Legend color="yellow" label={t("table.legend.pending")} />
+                <Legend color="blue" label={t("table.legend.myTable")} />
               </div>
             </>
           )}
@@ -329,14 +516,15 @@ export default function TableBooking() {
         {!loading && (
           <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-8 gap-4">
             {filteredTables.map((table) => {
-              const isMyBooked = myBookedTableIds.includes(table.id);
+              const myStatus = myBookedStatusMap[table.id];
+              const isMyBooked = !!myStatus;
               const isOtherBooked =
                 !isMyBooked &&
                 ["PENDING", "CONFIRMED", "OCCUPIED"].includes(table.statusName);
 
               const { colorClass, statusText } = getTableStatusClass(
                 table,
-                isMyBooked,
+                myStatus, // truyền status thay vì true/false
                 isOtherBooked,
                 translateStatus
               );
@@ -347,14 +535,20 @@ export default function TableBooking() {
                   content={
                     <div className="text-left space-y-1 p-1">
                       <p className="font-bold">{table.name}</p>
-                      <p className="text-sm">Sức chứa: {table.capacity}</p>
                       <p className="text-sm">
-                        Khu vực: {translateLocation(table.locationName)}
+                        {t("table.tooltip.capacity")}: {table.capacity}
                       </p>
                       <p className="text-sm">
-                        Vị trí: {translatePosition(table.positionName)}
+                        {t("table.tooltip.location")}:{" "}
+                        {translateLocation(table.locationName)}
                       </p>
-                      <p className="text-sm">Trạng thái: {statusText}</p>
+                      <p className="text-sm">
+                        {t("table.tooltip.position")}:{" "}
+                        {translatePosition(table.positionName)}
+                      </p>
+                      <p className="text-sm">
+                        {t("table.tooltip.status")}: {statusText}
+                      </p>
                     </div>
                   }>
                   <button
@@ -366,7 +560,9 @@ export default function TableBooking() {
                     onClick={() => handleBookTable(table)}
                     className={`p-4 rounded-lg border-2 text-center shadow-md transition transform hover:scale-105 ${colorClass}`}>
                     <p className="font-bold text-lg">{table.shortName}</p>
-                    <p className="text-sm font-medium">{table.capacity} chỗ</p>
+                    <p className="text-sm font-medium">
+                      {table.capacity} {t("table.tooltip.seats")}
+                    </p>
                     <p className="text-xs mt-1 opacity-80">
                       {translateLocation(table.locationName)}
                     </p>
@@ -380,24 +576,23 @@ export default function TableBooking() {
         {/* === MODAL ĐẶT BÀN / CẬP NHẬT === */}
         <BookingModal
           table={selectedTable}
-          open={openModal || showBookingModal}
+          show={bookingModalState !== null}
           minDateTime={minDateTime}
           onClose={() => {
-            setOpenModal(false);
-            setShowBookingModal(false);
+            setBookingModalState(null);
             setEditingReservation(null);
           }}
           onConfirm={handleConfirmBooking}
           onConfirmEdit={handleUpdateReservation}
           existingReservation={editingReservation}
-          mode={editingReservation ? "edit" : "create"}
+          mode={bookingModalState === "edit" ? "edit" : "create"}
         />
 
         {/* === MODAL DANH SÁCH BÀN ĐÃ ĐẶT === */}
         <BookedListModal
           show={showBookedList}
           onClose={() => setShowBookedList(false)}
-          reservations={myReservations}
+          reservations={activeReservations}
           tables={tables}
           loading={loadingReservations}
           onEdit={handleEditReservation}
@@ -408,65 +603,13 @@ export default function TableBooking() {
       {/* === CONFIRM DIALOG === */}
       <ConfirmDialog
         open={showConfirm}
-        title="Xác nhận hủy đặt bàn"
-        message="Bạn có chắc chắn muốn hủy đặt bàn này không?"
-        confirmText="Đồng ý"
-        cancelText="Thoát"
+        title={t("table.confirm.cancelTitle")}
+        message={t("table.confirm.cancelMessage")}
+        confirmText={t("table.confirm.confirm")}
+        cancelText={t("table.confirm.cancel")}
         onConfirm={handleConfirmCancel}
         onCancel={() => setShowConfirm(false)}
       />
     </section>
   );
-}
-
-/** -------------------------------
- *  SUB COMPONENTS & HELPERS
- *  ------------------------------- */
-
-/** Chú thích màu */
-function Legend({ color, label }: { color: string; label: string }) {
-  const colorMap: Record<string, string> = {
-    green: "bg-green-100 border-green-300",
-    red: "bg-red-200 border-red-400",
-    blue: "bg-blue-200 border-blue-400",
-  };
-  return (
-    <div className="flex items-center gap-1">
-      <span className={`w-4 h-4 rounded-full border ${colorMap[color]}`}></span>
-      <span>{label}</span>
-    </div>
-  );
-}
-
-/** Helper xác định class & status text theo trạng thái bàn */
-function getTableStatusClass(
-  table: TableEntity,
-  isMyBooked: boolean,
-  isOtherBooked: boolean,
-  translateStatus: (s: string) => string
-) {
-  if (isMyBooked)
-    return {
-      colorClass:
-        "bg-blue-100 border-blue-400 text-blue-800 cursor-not-allowed",
-      statusText: "Bạn đã đặt bàn này",
-    };
-
-  if (isOtherBooked)
-    return {
-      colorClass: "bg-red-200 border-red-400 text-gray-600 cursor-not-allowed",
-      statusText: "Đã có người đặt",
-    };
-
-  if (table.statusName === "AVAILABLE")
-    return {
-      colorClass:
-        "bg-green-100 border-green-300 hover:bg-green-200 text-green-800 hover:shadow-md",
-      statusText: "Còn trống",
-    };
-
-  return {
-    colorClass: "bg-gray-200 border-gray-300 text-gray-500 cursor-not-allowed",
-    statusText: translateStatus(table.statusName),
-  };
 }
